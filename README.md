@@ -13,7 +13,7 @@ Simple Windows desktop recorder. DXGI Desktop Duplication for capture, ffmpeg fo
 ## Install
 
 ```powershell
-git clone <your-repo-url> screecap
+git clone git@github.com:nickjoven/screecap.git
 cd screecap
 python -m venv .venv
 .venv\Scripts\activate
