@@ -1,0 +1,4 @@
+dxcam>=0.0.5
+numpy>=1.20
+PyQt6>=6.5
+pynput>=1.7
