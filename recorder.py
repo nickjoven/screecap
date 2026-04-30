@@ -104,6 +104,13 @@ class Recorder:
         try:
             while not self._stop.is_set():
                 frame = self._camera.get_latest_frame()
+                if frame is None:
+                    # dxcam clears its frame buffer and returns None only after
+                    # its capture thread has exited (typically via an unhandled
+                    # backend exception logged just above). Surface a clean
+                    # error and let shutdown() finalize the MP4.
+                    self.error = "dxcam capture stopped unexpectedly (see log for details)"
+                    break
                 self._proc.stdin.write(frame.tobytes())
                 self.frame_count += 1
                 if self.duration and self.elapsed >= self.duration:
