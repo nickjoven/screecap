@@ -180,6 +180,16 @@ def list_audio_devices() -> list:
 
     ffmpeg writes the device list to stderr (regardless of -loglevel), and its
     return code is non-zero because '-i dummy' fails after the listing.
+
+    Two output formats, both handled:
+
+    - Legacy (ffmpeg <= ~4.x): devices grouped under "DirectShow audio
+      devices" / "DirectShow video devices" header lines, no per-device tag.
+    - Modern (ffmpeg ~7.x+): the header lines are gone; each device line is
+      tagged inline, e.g. `[in#0 @ ..] "Mic (USB)" (audio)`. Trust the tag.
+
+    Parsing only the header form silently returns zero devices on modern
+    ffmpeg even when devices exist.
     """
     try:
         proc = subprocess.run(
@@ -193,19 +203,31 @@ def list_audio_devices() -> list:
     in_audio = False
     for raw in proc.stderr.splitlines():
         line = raw.strip()
+        if "Alternative name" in line:
+            continue
+        # Legacy header lines (absent on modern ffmpeg).
         if "DirectShow audio devices" in line:
             in_audio = True
             continue
         if "DirectShow video devices" in line:
             in_audio = False
             continue
-        if not in_audio or "Alternative name" in line:
+        if '"' not in line:
             continue
-        if '"' in line:
-            start = line.index('"') + 1
-            end = line.rindex('"')
-            if end > start:
-                devices.append(line[start:end])
+        # Modern: inline tag at end of the device line wins. Legacy: no
+        # tag, fall back to which header section we're in.
+        if line.endswith("(audio)"):
+            is_audio = True
+        elif line.endswith("(video)"):
+            is_audio = False
+        else:
+            is_audio = in_audio
+        if not is_audio:
+            continue
+        start = line.index('"') + 1
+        end = line.rindex('"')
+        if end > start:
+            devices.append(line[start:end])
     return devices
 
 
