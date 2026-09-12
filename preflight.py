@@ -1,5 +1,7 @@
 """Preflight checks + encoder selection. Each failed Check carries a remediation."""
+import datetime
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -254,3 +256,75 @@ def probe_audio_device(name: str) -> Check:
                    "exclusively by another application, then retry.")
         return Check(False, f"audio:{name}", err or "non-zero exit", rem)
     return Check(True, f"audio:{name}", "audio probe succeeded")
+
+
+def timestamped_path(path: str) -> str:
+    """Insert _YYYY-MM-DD_HH-MM-SS before the extension. Always applied.
+
+    recording.mp4 -> recording_2026-04-30_19-46-10.mp4
+    """
+    root, ext = os.path.splitext(path)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{root}_{stamp}{ext}"
+
+
+def next_numbered_path(path: str) -> str:
+    """Windows-style collision avoidance: recording.mp4 -> recording (1).mp4.
+
+    Returns `path` unchanged if nothing exists there. Otherwise strips any
+    existing " (n)" suffix and returns the first free "(n)" from 1 upward.
+    """
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    root = re.sub(r" \(\d+\)$", "", root)
+    n = 1
+    while True:
+        candidate = f"{root} ({n}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+
+@dataclass
+class AudioLevels:
+    ok: bool
+    peak_db: Optional[float]   # None => -inf (digital silence)
+    mean_db: Optional[float]   # None => -inf
+    error: Optional[str] = None
+
+
+_VOLUME_RE = re.compile(r"(max|mean)_volume:\s*(-?[\d.]+|-inf)\s*dB")
+
+
+def measure_audio_levels(name: str, duration_s: float = 3.0) -> AudioLevels:
+    """Capture `duration_s` from the dshow device and report peak/mean dBFS.
+
+    Uses ffmpeg's `volumedetect` filter; it prints `max_volume` and
+    `mean_volume` to stderr at the end of the run. Used by the GUI's
+    "Test audio" button so the user can tell a live mic from a dead one
+    (a device that opens cleanly but delivers silence still "passes"
+    probe_audio_device).
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info",
+        "-f", "dshow", "-i", f"audio={name}",
+        "-t", f"{duration_s:.2f}",
+        "-af", "volumedetect", "-f", "null", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=duration_s + 15)
+    except subprocess.TimeoutExpired:
+        return AudioLevels(False, None, None, "ffmpeg timed out")
+    except Exception as e:
+        return AudioLevels(False, None, None, f"failed to launch ffmpeg: {e}")
+    stderr = proc.stderr.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        last = (stderr.strip().splitlines() or ["non-zero exit"])[-1]
+        return AudioLevels(False, None, None, last)
+    found = {}
+    for key, val in _VOLUME_RE.findall(stderr):
+        found[key] = None if val == "-inf" else float(val)
+    if "max" not in found and "mean" not in found:
+        return AudioLevels(False, None, None, "volumedetect produced no output")
+    return AudioLevels(True, found.get("max"), found.get("mean"))
