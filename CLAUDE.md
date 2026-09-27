@@ -22,13 +22,16 @@ There is no test suite or build step.
 
 ## Architecture
 
-Four files, two layers — engine and front-ends:
+Engine + front-ends + integration layer:
 
 ```
-preflight.py     checks + encoder selection + device enumeration   (UI-agnostic)
-recorder.py      Recorder engine: dxcam capture -> ffmpeg pipe     (UI-agnostic)
-record.py        CLI front-end (argparse, signal.SIGINT)
-gui.py           PyQt6 front-end (QThread worker, QTimer polling, rebindable hotkey)
+preflight.py            checks + encoder selection + device enumeration   (UI-agnostic)
+recorder.py             Recorder engine: dxcam capture -> ffmpeg pipe     (UI-agnostic)
+league/                 LCU (REST + WebSocket) and Live Client Data       (UI-agnostic)
+loadouts.py             Per-champion spell/rune memory + apply via LCU    (UI-agnostic)
+record.py               CLI front-end (argparse, signal.SIGINT)
+gui.py                  PyQt6 front-end (worker thread, hotkey, tray icon)
+windows_integration.py  AppUserModelID, run-on-login, shortcut, jump list (Win-only)
 ```
 
 Both front-ends compose the same engine. Do not duplicate engine logic into a UI.
@@ -66,7 +69,11 @@ Hard rules:
 - **`video_mode=True` on `camera.start()` is required.** Without it, dxcam skips frames when the screen hasn't changed, and the resulting MP4 has broken timing.
 - **`shutdown()` must close stdin and wait — not kill.** Killing ffmpeg before it finalizes the moov atom produces an unplayable MP4. The 15 s ceiling exists so a hung ffmpeg can't hold the caller hostage; if it trips, `recorder.error` is set.
 - **Audio requires `-shortest`.** dshow audio is a live source with no EOF. Without `-shortest`, ffmpeg hangs forever after the video pipe closes, waiting for audio that never ends.
-- **`-thread_queue_size 1024`** on both inputs avoids "real-time buffer too full" warnings from dshow at higher fps.
+- **`-thread_queue_size 1024`** on both inputs sizes the inter-thread *packet* queue at higher fps. It is **not** the dshow real-time buffer — the "real-time buffer too full ... [rtbufsize parameter]! frame dropped!" warning is a different knob.
+- **`-rtbufsize 256M` (`AUDIO_RTBUFSIZE`) on every dshow audio input.** ffmpeg's default dshow real-time buffer is ~3 MB; under load — or whenever the video clock stalls and `-shortest`-paced audio backs up — it overflows continuously and ffmpeg drops *every* audio frame, yielding a silent track. This is the usual root cause of "no audio." Do not conflate it with `-thread_queue_size`.
+- **A side-thread watchdog (`STALL_TIMEOUT`, default 30 s) aborts a wedged capture loop.** It catches `get_latest_frame()` blocking forever — which neither the `frame is None` check (commit `0806b28`) nor `_stop` can reach because `run()` never returns from the call. On a stall it stops the **camera, never ffmpeg**: dxcam then returns `None`, the existing None branch breaks the loop, and `shutdown()` finalizes the MP4 normally (the no-kill invariant holds). It does **not** catch the asleep-screen case where `video_mode` keeps emitting duplicated frames (`frame_count` still advances) — that needs an auto-record duration cap in the front-end.
+- **`-use_wallclock_as_timestamps 1` on the video pipe + `-fps_mode vfr` on the output.** The raw pipe would otherwise be treated as constant-rate `-r fps`: a slow/stalled capture makes video's media clock lag wall time, ffmpeg throttles the pipe read, and the live dshow audio buffer overflows → dropped audio. Wall-clock PTS puts video on the same real timeline as the audio, so the continuous audio is effectively the clock master and video conforms (sparse/stretched) instead of starving it. This is "audio as clock master" achieved *without* taking dshow capture away from ffmpeg — the in-process-mux decision above stays intact. The two flags are a pair: wall-clock input makes the stream genuinely variable-rate, so the muxer must be told `vfr` rather than re-padding back to CFR (which would reintroduce the divergence). **Tradeoff: output is VFR**, not CFR. `-r fps` stays only as the nominal rate.
+- **`recorder.health()` is the post-record quality verdict, distinct from `recorder.error`.** `error` = hard failure. `health()` catches the class an `rc=0` ffmpeg hides: a valid file with a gappy/silent audio track. It keys off `audio_drops`, tallied from the dshow "frame dropped" stderr lines (and their "Last message repeated N times" collapses) in `_pump_ffmpeg_stderr` — an xrun counter. Both front-ends surface it: the CLI exits `3` (vs `2` for hard error) on degraded; the GUI shows an advisory "audio degraded" warning, not the red "Error" state. Don't route degradation through `error` — it is advisory, not fatal.
 - **`request_stop()` is signal-safe and non-blocking.** `shutdown()` is the blocking finalizer. They are separate so the CLI's SIGINT handler can call only `request_stop()`.
 - **Multi-device audio uses `-filter_complex amix=inputs=N:duration=shortest`** with explicit `-map 0:v -map [aout]`. The `[N:a]` indices are 1-based against the audio inputs because input `0` is the raw video pipe. Adding the filter only when N>1 keeps the single-device path simple.
 
@@ -89,9 +96,30 @@ Storing the target as a pynput-native `Key` or `KeyCode` (not a Qt `QKeySequence
 
 Qt's screen ordering is *assumed* to match `dxcam`'s `output_idx` ordering; this is true for the common case but not guaranteed. The picker logs a warning and bails if `monitor_idx` is out of range for `QGuiApplication.screens()`.
 
+### Tray icon, single-instance, jump list
+
+The GUI is single-instance via `QLocalServer` on the key `screecap-gui`. A second invocation tries to connect to that socket; on success it sends one of:
+
+- `show` — raise the running window (sent when no other action was requested);
+- `jump:<action>` — dispatch a jump-list verb (`toggle-record`, `open-last`, `toggle-auto-record`, `open-data-dir`).
+
+If the connect fails (no server yet), the new process *becomes* the server and dispatches the action against itself. This is what lets jump-list tasks "do the thing" whether or not the GUI was already running, without ever spawning a duplicate.
+
+Three invariants make the tray work:
+
+1. **`QApplication.setQuitOnLastWindowClosed(False)`** is set in `main()` before constructing the app. Without it, hiding the last window would quit the process and the tray would disappear.
+2. **`closeEvent` hides instead of closing** unless `_really_quit` is set. Only the tray's "Quit" action sets it. As a fallback, if no system tray is available, close behaves normally — so the app can still be exited on systems without a tray.
+3. **`AppUserModelID` is set at module import time** in `gui.py` via `windows_integration.set_app_user_model_id()`, *before* any window or shell COM is touched. Without it, taskbar pinning and jump-list grouping attach to `pythonw.exe` instead of the app, and the running process appears as a separate icon from a pinned shortcut.
+
+`--minimized` skips the initial `show()` (used by the run-on-login entry). `--jump=<action>` is for jump-list tasks: handed off to a running instance via IPC, or run by this instance after the GUI is up. Shortcuts created via `windows_integration.install_shortcut` deliberately do *not* pass `--minimized` so clicking them from the Start Menu opens the window; only the `HKCU\Run` entry passes `--minimized`.
+
+The jump-list `PKEY_Title` (visible label) is set via `IPropertyStore` on each `IShellLink`; `SetDescription` only controls the hover tooltip. If the title isn't set, the entry shows the .exe filename instead.
+
 ## Common gotchas
 
 - **DRM-protected content captures as black frames** (Netflix, some streaming apps). Enforced by Windows; no library bypasses this.
 - **Multiple GPUs** (laptop iGPU + dGPU): `dxcam.create()` may pick the wrong one. Use `device_idx=` if you add a flag for it.
 - **ffmpeg "essentials" build lacks libx264.** The remediation strings already say this — keep it that way; it's the single most common setup failure.
 - **Stereo Mix is disabled by default on most Windows installs.** For system audio capture, the user must enable it in Sound settings (Recording tab → Show Disabled Devices) or use a virtual audio cable.
+- **`ffmpeg -list_devices` output format is version-dependent.** Legacy ffmpeg (≤ ~4.x) groups devices under "DirectShow audio/video devices" header lines; modern ffmpeg (~7.x+) drops the headers and tags each device inline as `(audio)`/`(video)`. `list_audio_devices()` handles both — header-only parsing silently returns *zero* devices on modern ffmpeg even though they exist. Keep both paths if you touch that parser.
+- **`pywin32` jump-list COM is non-fatal.** Every helper in `windows_integration.py` is wrapped in try/except and returns False (or None) on failure — the GUI keeps working without integration. Don't promote any of these failures into a hard error.
