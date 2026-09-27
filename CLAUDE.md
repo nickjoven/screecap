@@ -86,6 +86,10 @@ Hard rules:
 - **Auto-apply** (`_maybe_auto_apply`) runs on the EventStream thread on every session frame: when the picked champion has a locked row and the selected pair differs, it `PATCH`es `/my-selection` **once per champion per champ select** (`_auto_apply_seen`, cleared on `Delete`/disconnect). After that the user's manual changes win. The GUI calls `forget_auto_apply` when the lock toggles mid-select so a fresh lock applies immediately.
 - `apply_spells` (spells only) is split from `apply_loadout` (spells + runes) so the auto path never rewrites the rune page.
 
+**Defaults: League integration on, recording opt-in.** `lcu/enabled` (default True) owns the EventStream/tracker/panel (`_enable_lcu`/`_disable_lcu`). `lcu/auto_record` (default False) only gates whether `_on_lcu_phase_changed` starts a recording on `InProgress`; ticking it forces the League connection on, and turning the connection off unticks it. Don't re-couple them: the loadout features must work with recording off.
+
+**Postgame reminder** (`lcu/postgame_reminder`, default True): `_on_session_end` stores a `PlayedGame` (the pair actually played, even when the row is locked to something else); the first postgame phase (`is_postgame_phase`: WaitingForStats/PreEndOfGame/EndOfGame) consumes it via `take_last_played()` (one-shot, so one dialog per game) and shows `PostgameDialog` — non-modal, stays on top. "Keep" locks the pair that will be used next time; "Change…" → "Save + lock" locks a chosen pair. A dodge never reaches a postgame phase, so its `PlayedGame` is simply overwritten by the next champ select.
+
 In the GUI, `LoadoutPanel` renders a live "Now: D = …, F = …" line from `cell.spell1Id/spell2Id` on every frame (green = matches saved, orange = differs) and "(hovering)"/"(locked in)" from `pick_locked_in` — the local player's *completed* pick action, since `championId` is set on select, before the lock-in click. The identical-frame short-circuit must compare champ + spells + pick state, and must not fire on the first frame of a session (`_in_session`), or the panel stays hidden until a champion is picked.
 
 ### GUI threading model

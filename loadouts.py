@@ -231,6 +231,23 @@ def _intended_champion_id(cell: dict) -> int:
     return cell.get("championId") or cell.get("championPickIntent") or 0
 
 
+# Gameflow phases that mean "the match just ended" — the moment for a
+# postgame reminder. WaitingForStats comes first; the others follow it.
+POSTGAME_PHASES = frozenset({"WaitingForStats", "PreEndOfGame", "EndOfGame"})
+
+
+def is_postgame_phase(phase: str) -> bool:
+    return phase in POSTGAME_PHASES
+
+
+@dataclass
+class PlayedGame:
+    """What the local player actually took into the last game."""
+    champion_id: int
+    spell1_id: int
+    spell2_id: int
+
+
 class LoadoutTracker:
     """Watches LCU events and persists a loadout when champ select ends.
 
@@ -255,6 +272,10 @@ class LoadoutTracker:
         # select. One attempt per champion per session: after that the user's
         # manual changes win, and we don't hit the DB on every websocket frame.
         self._auto_apply_seen: set[int] = set()
+        # Set at champ-select end, consumed by the front-end's postgame
+        # reminder via take_last_played(). Holds the *played* pair even when
+        # the stored row is locked to something else.
+        self._last_played: Optional[PlayedGame] = None
 
     @property
     def puuid(self) -> Optional[str]:
@@ -329,6 +350,11 @@ class LoadoutTracker:
                 except Exception:
                     log.exception("session_changed callback raised")
 
+    def take_last_played(self) -> Optional[PlayedGame]:
+        """Return and clear the last champ-select outcome (one reminder per game)."""
+        played, self._last_played = self._last_played, None
+        return played
+
     def forget_auto_apply(self, champion_id: int) -> None:
         """Let the next session frame re-evaluate auto-apply for this champion.
 
@@ -381,6 +407,7 @@ class LoadoutTracker:
             return
         snapshot = self._snapshot_current_page()
         record_loadout(self._puuid, champ_id, spell1, spell2, snapshot)
+        self._last_played = PlayedGame(champ_id, spell1, spell2)
 
     def _snapshot_current_page(self) -> Optional[dict]:
         if self._client is None:

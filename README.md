@@ -58,6 +58,17 @@ python record.py --audio "Microphone" --audio "Stereo Mix"  # mix two sources
 - **Region selection**: numeric inputs, or click-and-drag a transparent overlay on the chosen monitor.
 - **Global hotkey**: rebindable, default F9, works while another window has focus.
 
+## League of Legends integration
+
+On by default, no recording involved. While the League client is running, screecap connects to its local API and:
+
+- **Remembers your loadout per champion** (summoner spells + a snapshot of the rune page) at the end of every champ select.
+- **Shows it in champ select**, with the spells you have selected right now coloured against the saved pair.
+- **Lock spells**: pin the pair for a champion. It is applied automatically the next time you pick that champion, and what you play last no longer overwrites it.
+- **Postgame reminder**: after each match, a small window asks whether to keep or change the spells for the champion you just played.
+
+**Recording League matches is opt-in.** Tick *Auto-record → League matches* to start a recording when a match begins and stop it when it ends. Untick *League → Loadout memory* to disconnect from the client entirely.
+
 ## Troubleshooting
 
 The three issues that cover ~90% of setup problems:

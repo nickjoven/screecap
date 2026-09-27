@@ -679,6 +679,141 @@ class LoadoutPanel(QtWidgets.QGroupBox):
             self._apply_btn.setEnabled(True)
 
 
+class PostgameDialog(QtWidgets.QDialog):
+    """Postgame reminder: keep or change the summoner spells for the champion just played.
+
+    Non-modal and stays on top so it is visible over the League client's
+    end-of-game screen. "Keep" locks the pair that will be used next time
+    (the played pair when nothing is locked). "Change…" reveals two spell
+    pickers; "Save" locks the chosen pair. Runes are never touched here.
+    """
+
+    def __init__(self, puuid: str, played: "loadouts.PlayedGame",
+                 champion_name: str, parent=None):
+        super().__init__(parent)
+        self._puuid = puuid
+        self._played = played
+        self.setWindowTitle(f"Postgame — {champion_name}")
+        self.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setModal(False)
+
+        current = loadouts.get_loadout(puuid, played.champion_id)
+        self._locked = bool(current and current.locked)
+        if self._locked:
+            next_pair = (current.spell1_id, current.spell2_id)
+        else:
+            next_pair = (played.spell1_id, played.spell2_id)
+        self._next_pair = next_pair
+
+        layout = QtWidgets.QVBoxLayout(self)
+        played_txt = (f"You played <b>{champion_name}</b> with "
+                      f"D = <b>{loadouts.spell_name(played.spell1_id)}</b>, "
+                      f"F = <b>{loadouts.spell_name(played.spell2_id)}</b>.")
+        layout.addWidget(QtWidgets.QLabel(played_txt))
+        if self._locked and next_pair != (played.spell1_id, played.spell2_id):
+            nxt = (f"Locked for next time: "
+                   f"<span style='color:{SPELL_MISMATCH_COLOR}'>"
+                   f"{loadouts.spell_name(next_pair[0])} + "
+                   f"{loadouts.spell_name(next_pair[1])}</span> (differs from this game).")
+        elif self._locked:
+            nxt = (f"<span style='color:{SPELL_MATCH_COLOR}'>🔒 Locked</span> — "
+                   "this pair is applied automatically next time.")
+        else:
+            nxt = ("Not locked — next time starts from this pair, "
+                   "but whatever you play last overwrites it.")
+        self._next_label = QtWidgets.QLabel(nxt)
+        self._next_label.setWordWrap(True)
+        layout.addWidget(self._next_label)
+
+        # Change… reveals this row.
+        self._change_box = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(self._change_box)
+        row.setContentsMargins(0, 0, 0, 0)
+        self._d_combo = QtWidgets.QComboBox()
+        self._f_combo = QtWidgets.QComboBox()
+        for combo in (self._d_combo, self._f_combo):
+            for sid, name in sorted(loadouts.SUMMONER_SPELL_NAMES.items(),
+                                    key=lambda kv: kv[1]):
+                combo.addItem(name, sid)
+        self._select_spell(self._d_combo, next_pair[0])
+        self._select_spell(self._f_combo, next_pair[1])
+        row.addWidget(QtWidgets.QLabel("D:"))
+        row.addWidget(self._d_combo, 1)
+        row.addWidget(QtWidgets.QLabel("F:"))
+        row.addWidget(self._f_combo, 1)
+        self._change_box.setVisible(False)
+        layout.addWidget(self._change_box)
+
+        self._status = QtWidgets.QLabel("")
+        self._status.setStyleSheet("color: gray;")
+        layout.addWidget(self._status)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self._keep_btn = QtWidgets.QPushButton(
+            "Keep" if self._locked else "Keep (lock these)")
+        self._keep_btn.setToolTip(
+            "Leave the lock as it is." if self._locked else
+            "Lock the pair you just played so it is applied automatically\n"
+            "next time you pick this champion."
+        )
+        self._keep_btn.clicked.connect(self._keep)
+        self._change_btn = QtWidgets.QPushButton("Change…")
+        self._change_btn.clicked.connect(self._show_change)
+        self._save_btn = QtWidgets.QPushButton("Save + lock")
+        self._save_btn.clicked.connect(self._save_change)
+        self._save_btn.setVisible(False)
+        self._dismiss_btn = QtWidgets.QPushButton("Dismiss")
+        self._dismiss_btn.clicked.connect(self.reject)
+        buttons.addWidget(self._keep_btn)
+        buttons.addWidget(self._change_btn)
+        buttons.addWidget(self._save_btn)
+        buttons.addStretch()
+        buttons.addWidget(self._dismiss_btn)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def _select_spell(combo: QtWidgets.QComboBox, spell_id: int):
+        idx = combo.findData(spell_id)
+        if idx < 0 and spell_id > 0:
+            combo.addItem(loadouts.spell_name(spell_id), spell_id)
+            idx = combo.count() - 1
+        combo.setCurrentIndex(max(idx, 0))
+
+    def chosen_pair(self) -> tuple[int, int]:
+        return (int(self._d_combo.currentData()), int(self._f_combo.currentData()))
+
+    def _keep(self):
+        if self._locked:
+            self.accept()
+            return
+        self._lock_pair(self._next_pair)
+
+    def _show_change(self):
+        self._change_box.setVisible(True)
+        self._save_btn.setVisible(True)
+        self._change_btn.setVisible(False)
+        self._keep_btn.setVisible(False)
+
+    def _save_change(self):
+        d, f = self.chosen_pair()
+        if d == f:
+            self._status.setStyleSheet("color: #c0392b;")
+            self._status.setText("D and F must differ")
+            return
+        self._lock_pair((d, f))
+
+    def _lock_pair(self, pair: tuple[int, int]):
+        try:
+            loadouts.set_locked(self._puuid, self._played.champion_id, True,
+                                pair[0], pair[1])
+        except Exception as e:
+            self._status.setStyleSheet("color: #c0392b;")
+            self._status.setText(f"failed: {e}")
+            log.exception("postgame lock failed")
+            return
+        self.accept()
+
+
 class AudioMeterWorker(QtCore.QObject):
     """Runs preflight.measure_audio_levels for a list of devices, one at a time.
 
@@ -920,15 +1055,34 @@ class MainWindow(QtWidgets.QMainWindow):
         hotkey_row.addStretch()
         form.addRow("Hotkey:", hotkey_row)
 
-        self.auto_record_check = QtWidgets.QCheckBox("League matches")
+        league_row = QtWidgets.QHBoxLayout()
+        self.lcu_check = QtWidgets.QCheckBox("Loadout memory")
+        self.lcu_check.setToolTip(
+            "Connect to the League client: remember spells/runes per champion,\n"
+            "show them in champ select, and apply locked spells. No recording."
+        )
+        self.lcu_check.toggled.connect(self._toggle_lcu)
+        self.postgame_check = QtWidgets.QCheckBox("Postgame reminder")
+        self.postgame_check.setToolTip(
+            "After each match, ask whether to keep or change the summoner\n"
+            "spells for the champion you just played."
+        )
+        self.postgame_check.toggled.connect(self._save_postgame_pref)
+        league_row.addWidget(self.lcu_check)
+        league_row.addWidget(self.postgame_check)
+        league_row.addStretch()
+        form.addRow("League:", league_row)
+        self.auto_record_status = QtWidgets.QLabel("(off)")
+        form.addRow("", self.auto_record_status)
+
+        self.auto_record_check = QtWidgets.QCheckBox("League matches (opt-in)")
         self.auto_record_check.setToolTip(
             "Start recording when the League gameflow phase becomes 'InProgress'\n"
-            "and stop on any other phase. Manual recordings are unaffected."
+            "and stop on any other phase. Manual recordings are unaffected.\n"
+            "Off by default; needs the League connection above."
         )
         self.auto_record_check.toggled.connect(self._toggle_auto_record)
         form.addRow("Auto-record:", self.auto_record_check)
-        self.auto_record_status = QtWidgets.QLabel("(off)")
-        form.addRow("", self.auto_record_status)
 
         self.loadout_panel = LoadoutPanel()
         form.addRow(self.loadout_panel)
@@ -1166,21 +1320,41 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_auto_record_pref(self):
         # QSettings.value with type=bool handles the str-vs-bool quirk on Windows.
-        enabled = self._settings.value("lcu/auto_record", False, type=bool)
-        # Triggers _toggle_auto_record, which actually starts the stream.
-        self.auto_record_check.setChecked(enabled)
+        # League integration (loadout memory, reminders) is on by default;
+        # recording matches is opt-in.
+        self.postgame_check.blockSignals(True)
+        self.postgame_check.setChecked(
+            self._settings.value("lcu/postgame_reminder", True, type=bool))
+        self.postgame_check.blockSignals(False)
+        lcu = self._settings.value("lcu/enabled", True, type=bool)
+        auto = self._settings.value("lcu/auto_record", False, type=bool)
+        # Triggers _toggle_lcu, which actually starts the stream.
+        self.lcu_check.setChecked(lcu or auto)
+        self.auto_record_check.setChecked(auto)
 
     def _save_auto_record_pref(self, enabled: bool):
         self._settings.setValue("lcu/auto_record", enabled)
 
+    def _save_postgame_pref(self, enabled: bool):
+        self._settings.setValue("lcu/postgame_reminder", enabled)
+
     def _toggle_auto_record(self, on: bool):
         self._save_auto_record_pref(on)
-        if on:
-            self._enable_auto_record()
-        else:
-            self._disable_auto_record()
+        if on and not self.lcu_check.isChecked():
+            # Auto-record needs the phase stream.
+            self.lcu_check.setChecked(True)
+        log.info("auto-record %s", "enabled" if on else "disabled")
 
-    def _enable_auto_record(self):
+    def _toggle_lcu(self, on: bool):
+        self._settings.setValue("lcu/enabled", on)
+        if on:
+            self._enable_lcu()
+        else:
+            self._disable_lcu()
+            if self.auto_record_check.isChecked():
+                self.auto_record_check.setChecked(False)
+
+    def _enable_lcu(self):
         if self._lcu_stream is not None:
             return
         try:
@@ -1231,13 +1405,13 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self._lcu_stream.start()
             self.auto_record_status.setText("waiting for League client...")
-            log.info("auto-record enabled")
+            log.info("League integration enabled")
         except RuntimeError as e:
             # websocket-client missing.
-            QtWidgets.QMessageBox.warning(self, "Auto-record", str(e))
-            self.auto_record_check.setChecked(False)
+            QtWidgets.QMessageBox.warning(self, "League integration", str(e))
+            self.lcu_check.setChecked(False)
 
-    def _disable_auto_record(self):
+    def _disable_lcu(self):
         if self._lcu_stream is not None:
             self._lcu_stream.stop(timeout=2.0)
             self._lcu_stream = None
@@ -1246,7 +1420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._loadout_tracker = None
         self.loadout_panel.attach_tracker(None)
         self.auto_record_status.setText("(off)")
-        log.info("auto-record disabled")
+        log.info("League integration disabled")
 
     @QtCore.pyqtSlot()
     def _on_lcu_connected(self):
@@ -1262,12 +1436,36 @@ class MainWindow(QtWidgets.QMainWindow):
         log.info("LCU phase: %s (recording=%s, auto_started=%s)",
                  phase, self.thread is not None, self._auto_started)
         if phase == "InProgress":
-            if self.thread is None:
+            if self.thread is None and self.auto_record_check.isChecked():
                 self._auto_started = True
                 self._start_recording()
         else:
             if self._auto_started and self.recorder is not None:
                 self._stop_recording()
+        if loadouts.is_postgame_phase(phase):
+            self._maybe_show_postgame()
+
+    def _maybe_show_postgame(self):
+        """Show the keep/change reminder once per game, if enabled."""
+        tracker = self._loadout_tracker
+        if tracker is None or not tracker.puuid:
+            return
+        played = tracker.take_last_played()
+        if played is None or not self.postgame_check.isChecked():
+            return
+        name = tracker.champion_name(played.champion_id)
+        dlg = PostgameDialog(tracker.puuid, played, name, parent=self)
+        dlg.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        if self.tray is not None and self.tray.isVisible():
+            self.tray.showMessage(
+                f"Postgame — {name}",
+                f"Played {loadouts.spell_name(played.spell1_id)} + "
+                f"{loadouts.spell_name(played.spell2_id)}. Keep or change?",
+                QtWidgets.QSystemTrayIcon.MessageIcon.Information, 8000,
+            )
 
     # ------------------------------------------------------------------
     # Tray icon
