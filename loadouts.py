@@ -7,6 +7,10 @@ session end. Apply pushes the row back to the client by writing to a single
 dedicated `[screecap] auto` rune page so the user's hand-curated pages are
 never overwritten.
 
+A row can be *locked*: its spell pair is pinned. A locked pair is not
+overwritten by whatever was played last, and the tracker re-applies it
+automatically (once per champ select) whenever that champion is picked.
+
 UI-agnostic. The Qt-specific bridging lives in gui.py.
 """
 import json
@@ -40,6 +44,27 @@ def spell_name(spell_id: int) -> str:
     return SUMMONER_SPELL_NAMES.get(spell_id, f"Spell {spell_id}")
 
 
+def current_spells(cell: dict) -> tuple[int, int]:
+    """(spell1Id, spell2Id) currently selected on a champ-select cell; 0 = unset."""
+    return (int(cell.get("spell1Id") or 0), int(cell.get("spell2Id") or 0))
+
+
+def pick_locked_in(session: dict) -> bool:
+    """True once the local player's pick action is completed (champion locked in).
+
+    `championId` on the cell is set as soon as a champion is *selected*, before
+    the lock-in click; the completed pick action is the actual lock-in signal.
+    """
+    local_cell_id = session.get("localPlayerCellId")
+    for group in session.get("actions") or []:
+        for action in group or []:
+            if (action.get("type") == "pick"
+                    and action.get("actorCellId") == local_cell_id
+                    and action.get("completed")):
+                return True
+    return False
+
+
 @dataclass
 class Loadout:
     puuid: str
@@ -49,6 +74,7 @@ class Loadout:
     rune_page: Optional[dict]   # {name, primaryStyleId, subStyleId, selectedPerkIds}
     last_seen: datetime
     count: int
+    locked: bool = False   # added in schema v2; default keeps v1 rows parsing
 
 
 # ----------------------------------------------------------------------------
@@ -74,7 +100,23 @@ def _connect() -> sqlite3.Connection:
             PRIMARY KEY (puuid, champion_id)
         )
     """)
+    _migrate(conn)
     return conn
+
+
+# Schema versions (additive only so far):
+#   1: puuid, champion_id, spell1_id, spell2_id, rune_page_json, last_seen, count
+#   2: + locked INTEGER NOT NULL DEFAULT 0
+SCHEMA_VERSION = 2
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(loadout)")}
+    if "locked" not in cols:
+        conn.execute(
+            "ALTER TABLE loadout ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"
+        )
+        log.info("loadouts.db migrated to schema v2 (locked column)")
 
 
 def record_loadout(puuid: str, champion_id: int, spell1_id: int,
@@ -84,6 +126,9 @@ def record_loadout(puuid: str, champion_id: int, spell1_id: int,
     rune_page is preserved across writes if the new value is None — that way
     a session that ended without us being able to GET /currentpage doesn't
     wipe a previously-snapshotted page.
+
+    If the row is locked, the stored spell pair is kept as-is: last_seen,
+    count and runes still update, but the pin wins over what was played.
     """
     if not puuid or champion_id <= 0:
         return
@@ -95,8 +140,10 @@ def record_loadout(puuid: str, champion_id: int, spell1_id: int,
                                  rune_page_json, last_seen, count)
             VALUES (?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(puuid, champion_id) DO UPDATE SET
-                spell1_id = excluded.spell1_id,
-                spell2_id = excluded.spell2_id,
+                spell1_id = CASE WHEN loadout.locked THEN loadout.spell1_id
+                                 ELSE excluded.spell1_id END,
+                spell2_id = CASE WHEN loadout.locked THEN loadout.spell2_id
+                                 ELSE excluded.spell2_id END,
                 rune_page_json = COALESCE(excluded.rune_page_json,
                                           loadout.rune_page_json),
                 last_seen = excluded.last_seen,
@@ -112,12 +159,12 @@ def get_loadout(puuid: str, champion_id: int) -> Optional[Loadout]:
         return None
     with _connect() as conn:
         row = conn.execute("""
-            SELECT spell1_id, spell2_id, rune_page_json, last_seen, count
+            SELECT spell1_id, spell2_id, rune_page_json, last_seen, count, locked
             FROM loadout WHERE puuid = ? AND champion_id = ?
         """, (puuid, champion_id)).fetchone()
     if row is None:
         return None
-    spell1_id, spell2_id, rune_json, last_seen, count = row
+    spell1_id, spell2_id, rune_json, last_seen, count, locked = row
     return Loadout(
         puuid=puuid,
         champion_id=champion_id,
@@ -126,7 +173,45 @@ def get_loadout(puuid: str, champion_id: int) -> Optional[Loadout]:
         rune_page=json.loads(rune_json) if rune_json else None,
         last_seen=datetime.fromisoformat(last_seen),
         count=count,
+        locked=bool(locked),
     )
+
+
+def set_locked(puuid: str, champion_id: int, locked: bool,
+               spell1_id: int = 0, spell2_id: int = 0) -> Optional[Loadout]:
+    """Pin (or unpin) the spell pair for (puuid, champion_id).
+
+    When locking, a non-zero spell pair replaces the stored one — pass the
+    spells currently selected in champ select so "lock" means "lock *these*".
+    With zeros, the stored pair is pinned unchanged. Locking a champion with
+    no history inserts a row with count=0 (never played, but pinned).
+    Unlocking never touches the spells. Returns the resulting row.
+    """
+    if not puuid or champion_id <= 0:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        if locked and spell1_id > 0 and spell2_id > 0:
+            conn.execute("""
+                INSERT INTO loadout (puuid, champion_id, spell1_id, spell2_id,
+                                     rune_page_json, last_seen, count, locked)
+                VALUES (?, ?, ?, ?, NULL, ?, 0, 1)
+                ON CONFLICT(puuid, champion_id) DO UPDATE SET
+                    spell1_id = excluded.spell1_id,
+                    spell2_id = excluded.spell2_id,
+                    locked = 1
+            """, (puuid, champion_id, spell1_id, spell2_id, now))
+        else:
+            conn.execute("""
+                UPDATE loadout SET locked = ?
+                WHERE puuid = ? AND champion_id = ?
+            """, (1 if locked else 0, puuid, champion_id))
+    result = get_loadout(puuid, champion_id)
+    if result is not None:
+        log.info("loadout %s: champ=%d spells=(%s,%s)",
+                 "locked" if result.locked else "unlocked", champion_id,
+                 spell_name(result.spell1_id), spell_name(result.spell2_id))
+    return result
 
 
 # ----------------------------------------------------------------------------
@@ -166,6 +251,10 @@ class LoadoutTracker:
         self._puuid: Optional[str] = None
         self._latest_session: Optional[dict] = None
         self._champion_names: Optional[dict] = None
+        # Champions already considered for auto-apply in the current champ
+        # select. One attempt per champion per session: after that the user's
+        # manual changes win, and we don't hit the DB on every websocket frame.
+        self._auto_apply_seen: set[int] = set()
 
     @property
     def puuid(self) -> Optional[str]:
@@ -208,6 +297,7 @@ class LoadoutTracker:
     def on_disconnect(self) -> None:
         self._client = None
         self._latest_session = None
+        self._auto_apply_seen.clear()
         if self._on_session_changed:
             try:
                 self._on_session_changed(None)
@@ -222,6 +312,7 @@ class LoadoutTracker:
         if event_type == "Delete":
             self._on_session_end()
             self._latest_session = None
+            self._auto_apply_seen.clear()
             if self._on_session_changed:
                 try:
                     self._on_session_changed(None)
@@ -231,11 +322,47 @@ class LoadoutTracker:
         # Create or Update — `data` is the full session dict.
         if isinstance(data, dict):
             self._latest_session = data
+            self._maybe_auto_apply(data)
             if self._on_session_changed:
                 try:
                     self._on_session_changed(data)
                 except Exception:
                     log.exception("session_changed callback raised")
+
+    def forget_auto_apply(self, champion_id: int) -> None:
+        """Let the next session frame re-evaluate auto-apply for this champion.
+
+        Call after the lock state changes mid-select so a fresh lock takes
+        effect without waiting for the next champ select.
+        """
+        self._auto_apply_seen.discard(champion_id)
+
+    def _maybe_auto_apply(self, session: dict) -> None:
+        """Push the locked spell pair when a locked champion is picked.
+
+        Runs on the EventStream thread; the PATCH is one short local HTTP call,
+        the same class of work _on_session_end already does here.
+        """
+        if self._client is None or not self._puuid:
+            return
+        cell = _find_my_cell(session)
+        if cell is None:
+            return
+        champ_id = _intended_champion_id(cell)
+        if champ_id <= 0 or champ_id in self._auto_apply_seen:
+            return
+        self._auto_apply_seen.add(champ_id)
+        loadout = get_loadout(self._puuid, champ_id)
+        if loadout is None or not loadout.locked:
+            return
+        if current_spells(cell) == (loadout.spell1_id, loadout.spell2_id):
+            log.info("locked spells already selected: champ=%d", champ_id)
+            return
+        try:
+            apply_spells(self._client, loadout)
+            log.info("auto-applied locked spells: champ=%d", champ_id)
+        except Exception:
+            log.exception("auto-apply locked spells failed (champ=%d)", champ_id)
 
     def _on_session_end(self) -> None:
         if self._client is None or not self._puuid:
@@ -291,12 +418,7 @@ def apply_loadout(client: Client, loadout: Loadout) -> None:
     runes_err: Optional[Exception] = None
 
     try:
-        client.request("PATCH", "/lol-champ-select/v1/session/my-selection",
-                       {"spell1Id": loadout.spell1_id,
-                        "spell2Id": loadout.spell2_id})
-        log.info("applied spells: champ=%d (%s, %s)",
-                 loadout.champion_id,
-                 spell_name(loadout.spell1_id), spell_name(loadout.spell2_id))
+        apply_spells(client, loadout)
     except Exception as e:
         spells_err = e
         log.exception("apply spells failed (champ=%d)", loadout.champion_id)
@@ -323,6 +445,16 @@ def apply_loadout(client: Client, loadout: Loadout) -> None:
         raise spells_err
     if runes_err is not None:
         raise runes_err
+
+
+def apply_spells(client: Client, loadout: Loadout) -> None:
+    """Set summoner spells only. Valid only while champ select is active."""
+    client.request("PATCH", "/lol-champ-select/v1/session/my-selection",
+                   {"spell1Id": loadout.spell1_id,
+                    "spell2Id": loadout.spell2_id})
+    log.info("applied spells: champ=%d (%s, %s)",
+             loadout.champion_id,
+             spell_name(loadout.spell1_id), spell_name(loadout.spell2_id))
 
 
 def _ensure_scratch_page(client: Client) -> int:

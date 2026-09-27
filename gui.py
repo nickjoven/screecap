@@ -385,18 +385,32 @@ class MonitorPicker(QtWidgets.QWidget):
                 return
 
 
+# Spell highlight colours for the live "Now" line in LoadoutPanel.
+SPELL_MATCH_COLOR = "#27ae60"     # selected spell equals the saved/locked one
+SPELL_MISMATCH_COLOR = "#e67e22"  # selected spell differs from the saved one
+SPELL_NEUTRAL_COLOR = "gray"      # nothing saved to compare against / unset
+
+
 class LoadoutPanel(QtWidgets.QGroupBox):
     """Per-champion loadout memory: shows last spells/runes for the picked champion.
 
     Visible only while a champ-select session is live. Apply pushes the stored
     loadout back via apply_loadout — spells via PATCH /my-selection, runes
     written into the dedicated SCRATCH_PAGE_NAME page.
+
+    The "Now" line tracks the spells currently selected in champ select on
+    every session frame and colours each one against the saved pair. "Lock
+    spells" pins the pair for this champion: the tracker re-applies it on pick
+    and session-end recording no longer overwrites it.
     """
 
     def __init__(self, parent=None):
         super().__init__("Loadout memory", parent)
         self._tracker: "loadouts.LoadoutTracker | None" = None
+        self._in_session = False
         self._current_champ_id = 0
+        self._current_spells: tuple[int, int] = (0, 0)
+        self._pick_locked = False
         self._current_loadout: "loadouts.Loadout | None" = None
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -405,6 +419,14 @@ class LoadoutPanel(QtWidgets.QGroupBox):
         self._champ_label = QtWidgets.QLabel("(not in champ select)")
         self._champ_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(self._champ_label)
+
+        self._now_label = QtWidgets.QLabel("")
+        self._now_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self._now_label.setToolTip(
+            "Summoner spells currently selected in champ select.\n"
+            "Green = matches the saved pair, orange = differs."
+        )
+        layout.addWidget(self._now_label)
 
         self._loadout_label = QtWidgets.QLabel("")
         self._loadout_label.setWordWrap(True)
@@ -423,9 +445,20 @@ class LoadoutPanel(QtWidgets.QGroupBox):
         )
         self._apply_btn.clicked.connect(self._apply)
         self._apply_btn.setEnabled(False)
+        self._lock_check = QtWidgets.QCheckBox("Lock spells")
+        self._lock_check.setToolTip(
+            "Pin the summoner spells for this champion.\n"
+            "Locks the pair selected right now (or the saved pair if none is\n"
+            "selected yet). While locked: the pair is re-applied automatically\n"
+            "each time you pick this champion, and the spells you last played\n"
+            "no longer overwrite it. Runes are unaffected."
+        )
+        self._lock_check.setEnabled(False)
+        self._lock_check.toggled.connect(self._on_lock_toggled)
         self._status_label = QtWidgets.QLabel("")
         self._status_label.setStyleSheet("color: gray;")
         bottom.addWidget(self._apply_btn)
+        bottom.addWidget(self._lock_check)
         bottom.addWidget(self._status_label, 1)
         layout.addLayout(bottom)
 
@@ -437,14 +470,26 @@ class LoadoutPanel(QtWidgets.QGroupBox):
             self._reset()
 
     def _reset(self):
+        self._in_session = False
         self._current_champ_id = 0
+        self._current_spells = (0, 0)
+        self._pick_locked = False
         self._current_loadout = None
         self._champ_label.setText("(not in champ select)")
+        self._now_label.setText("")
         self._loadout_label.setText("")
         self._meta_label.setText("")
         self._status_label.setText("")
         self._apply_btn.setEnabled(False)
+        self._set_lock_checked(False)
+        self._lock_check.setEnabled(False)
         self.setVisible(False)
+
+    def _set_lock_checked(self, checked: bool):
+        # Programmatic sync must not fire the user-toggle handler.
+        self._lock_check.blockSignals(True)
+        self._lock_check.setChecked(checked)
+        self._lock_check.blockSignals(False)
 
     @QtCore.pyqtSlot(object)
     def on_session_changed(self, session):
@@ -456,27 +501,59 @@ class LoadoutPanel(QtWidgets.QGroupBox):
             self._reset()
             return
         champ_id = loadouts._intended_champion_id(cell)
+        spells = loadouts.current_spells(cell)
+        pick_locked = loadouts.pick_locked_in(session)
         # Cheap no-op: ignore identical updates so the apply-status flash isn't
-        # wiped out by every websocket frame.
-        if champ_id == self._current_champ_id:
+        # wiped out by every websocket frame. The first frame of a session
+        # always renders, even if it looks like the idle state (no pick yet).
+        if (self._in_session and champ_id == self._current_champ_id
+                and spells == self._current_spells
+                and pick_locked == self._pick_locked):
             return
+        champ_changed = not self._in_session or champ_id != self._current_champ_id
+        self._in_session = True
         self._current_champ_id = champ_id
-        self._status_label.setText("")
+        self._current_spells = spells
+        self._pick_locked = pick_locked
         self.setVisible(True)
+        if champ_changed:
+            self._status_label.setText("")
+            self._refresh_loadout(champ_id)
+        self._refresh_champ_label()
+        self._refresh_now_line()
+
+    def _refresh_champ_label(self):
+        champ_id = self._current_champ_id
         if champ_id <= 0:
             self._champ_label.setText("Champ select — no champion picked yet")
+            return
+        name = self._tracker.champion_name(champ_id) if self._tracker else f"#{champ_id}"
+        state = "locked in" if self._pick_locked else "hovering"
+        self._champ_label.setText(f"Champ select: {name}  ({state})")
+
+    def _refresh_loadout(self, champ_id: int):
+        """Reload the saved row for a newly picked champion and redraw its lines."""
+        if champ_id <= 0:
             self._loadout_label.setText("")
             self._meta_label.setText("")
             self._current_loadout = None
             self._apply_btn.setEnabled(False)
+            self._set_lock_checked(False)
+            self._lock_check.setEnabled(False)
             return
-        name = self._tracker.champion_name(champ_id) if self._tracker else f"#{champ_id}"
-        self._champ_label.setText(f"Champ select: {name}")
         loadout = None
         puuid = self._tracker.puuid if self._tracker else None
         if puuid:
             loadout = loadouts.get_loadout(puuid, champ_id)
         self._current_loadout = loadout
+        # Locking is possible as soon as a champion is picked — with no history
+        # it pins whatever is selected right now.
+        self._lock_check.setEnabled(bool(puuid))
+        self._set_lock_checked(bool(loadout and loadout.locked))
+        self._refresh_saved_line()
+
+    def _refresh_saved_line(self):
+        loadout = self._current_loadout
         if loadout is None:
             self._loadout_label.setText(
                 "(no history yet — your next game on this champion will be saved)"
@@ -484,15 +561,99 @@ class LoadoutPanel(QtWidgets.QGroupBox):
             self._meta_label.setText("")
             self._apply_btn.setEnabled(False)
             return
+        name = (self._tracker.champion_name(loadout.champion_id)
+                if self._tracker else f"#{loadout.champion_id}")
         spells = (
             f"D = {loadouts.spell_name(loadout.spell1_id)},   "
             f"F = {loadouts.spell_name(loadout.spell2_id)}"
         )
+        head = f"Locked on {name}:" if loadout.locked else f"Last on {name}:"
         runes_name = (loadout.rune_page or {}).get("name") or "(no runes saved)"
-        self._loadout_label.setText(f"Last on {name}:  {spells}\nRunes:  {runes_name}")
+        self._loadout_label.setText(f"{head}  {spells}\nRunes:  {runes_name}")
         last = loadout.last_seen.astimezone().strftime("%Y-%m-%d %H:%M")
-        self._meta_label.setText(f"Last seen {last} · played {loadout.count}x")
+        played = f"played {loadout.count}x" if loadout.count else "never played"
+        self._meta_label.setText(f"Last seen {last} · {played}")
         self._apply_btn.setEnabled(True)
+
+    def _refresh_now_line(self):
+        """Redraw the live D/F line, colouring each spell against the saved pair."""
+        if self._current_champ_id <= 0:
+            self._now_label.setText("")
+            return
+        saved = self._current_loadout
+        saved_pair = (saved.spell1_id, saved.spell2_id) if saved else None
+        parts = []
+        for key, spell_id, saved_id in (
+            ("D", self._current_spells[0], saved_pair[0] if saved_pair else 0),
+            ("F", self._current_spells[1], saved_pair[1] if saved_pair else 0),
+        ):
+            if spell_id <= 0:
+                color, text = SPELL_NEUTRAL_COLOR, "—"
+            else:
+                text = loadouts.spell_name(spell_id)
+                if saved_pair is None:
+                    color = SPELL_NEUTRAL_COLOR
+                elif spell_id == saved_id:
+                    color = SPELL_MATCH_COLOR
+                else:
+                    color = SPELL_MISMATCH_COLOR
+            parts.append(
+                f"{key} = <span style='color:{color}; font-weight:bold'>{text}</span>"
+            )
+        suffix = ""
+        if saved_pair is not None and self._current_spells == saved_pair:
+            suffix = (f"&nbsp;&nbsp;<span style='color:{SPELL_MATCH_COLOR}'>"
+                      f"{'🔒 locked in' if saved.locked else '✓ matches saved'}</span>")
+        elif saved_pair is not None and all(s > 0 for s in self._current_spells):
+            suffix = (f"&nbsp;&nbsp;<span style='color:{SPELL_MISMATCH_COLOR}'>"
+                      "≠ saved</span>")
+        self._now_label.setText("Now:  " + ",&nbsp;&nbsp; ".join(parts) + suffix)
+
+    def _on_lock_toggled(self, checked: bool):
+        puuid = self._tracker.puuid if self._tracker else None
+        champ_id = self._current_champ_id
+        if not puuid or champ_id <= 0:
+            self._set_lock_checked(False)
+            return
+        # Lock what is selected right now; fall back to the saved pair when
+        # the selection is incomplete (set_locked treats zeros as "keep").
+        s1, s2 = self._current_spells
+        if not (s1 > 0 and s2 > 0):
+            s1, s2 = 0, 0
+        try:
+            loadout = loadouts.set_locked(puuid, champ_id, checked, s1, s2)
+        except Exception as e:
+            self._status_label.setStyleSheet("color: #c0392b;")
+            self._status_label.setText(f"lock failed: {e}")
+            log.exception("set_locked from GUI raised")
+            self._set_lock_checked(not checked)
+            return
+        if checked and loadout is None:
+            # No row and nothing selected to pin: nothing to lock yet.
+            self._status_label.setStyleSheet("color: gray;")
+            self._status_label.setText("pick both spells first")
+            self._set_lock_checked(False)
+            return
+        self._current_loadout = loadout
+        if self._tracker is not None:
+            self._tracker.forget_auto_apply(champ_id)
+        self._refresh_saved_line()
+        self._refresh_now_line()
+        self._status_label.setStyleSheet("color: gray;")
+        self._status_label.setText("spells locked" if checked else "unlocked")
+        # A fresh lock whose pair isn't what's selected: apply it now rather
+        # than waiting for the next champ select.
+        if (checked and loadout is not None and self._tracker is not None
+                and self._tracker.client is not None
+                and self._current_spells != (loadout.spell1_id, loadout.spell2_id)):
+            try:
+                loadouts.apply_spells(self._tracker.client, loadout)
+                self._status_label.setStyleSheet("color: #27ae60;")
+                self._status_label.setText("locked + applied")
+            except Exception as e:
+                self._status_label.setStyleSheet("color: #c0392b;")
+                self._status_label.setText(f"locked, apply failed: {e}")
+                log.exception("apply_spells after lock raised")
 
     def _apply(self):
         if (self._tracker is None or self._tracker.client is None

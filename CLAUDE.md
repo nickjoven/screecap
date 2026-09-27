@@ -28,7 +28,7 @@ Engine + front-ends + integration layer:
 preflight.py            checks + encoder selection + device enumeration   (UI-agnostic)
 recorder.py             Recorder engine: dxcam capture -> ffmpeg pipe     (UI-agnostic)
 league/                 LCU (REST + WebSocket) and Live Client Data       (UI-agnostic)
-loadouts.py             Per-champion spell/rune memory + apply via LCU    (UI-agnostic)
+loadouts.py             Per-champion spell/rune memory, spell lock, apply   (UI-agnostic)
 record.py               CLI front-end (argparse, signal.SIGINT)
 gui.py                  PyQt6 front-end (worker thread, hotkey, tray icon)
 windows_integration.py  AppUserModelID, run-on-login, shortcut, jump list (Win-only)
@@ -76,6 +76,17 @@ Hard rules:
 - **`recorder.health()` is the post-record quality verdict, distinct from `recorder.error`.** `error` = hard failure. `health()` catches the class an `rc=0` ffmpeg hides: a valid file with a gappy/silent audio track. It keys off `audio_drops`, tallied from the dshow "frame dropped" stderr lines (and their "Last message repeated N times" collapses) in `_pump_ffmpeg_stderr` — an xrun counter. Both front-ends surface it: the CLI exits `3` (vs `2` for hard error) on degraded; the GUI shows an advisory "audio degraded" warning, not the red "Error" state. Don't route degradation through `error` — it is advisory, not fatal.
 - **`request_stop()` is signal-safe and non-blocking.** `shutdown()` is the blocking finalizer. They are separate so the CLI's SIGINT handler can call only `request_stop()`.
 - **Multi-device audio uses `-filter_complex amix=inputs=N:duration=shortest`** with explicit `-map 0:v -map [aout]`. The `[N:a]` indices are 1-based against the audio inputs because input `0` is the raw video pipe. Adding the filter only when N>1 keeps the single-device path simple.
+
+### Loadout memory and spell lock
+
+`loadouts.py` keeps one SQLite row per `(puuid, champion_id)` in `%LOCALAPPDATA%\screecap\loadouts.db`. Schema is versioned additively (`SCHEMA_VERSION`, migrated in `_migrate` via `PRAGMA table_info` + `ALTER TABLE ADD COLUMN ... DEFAULT`): v1 = spells/runes/last_seen/count, v2 adds `locked`. Never rename or drop a column — old rows must keep parsing.
+
+- **Capture** happens on the champ-select `Delete` event (`LoadoutTracker._on_session_end`): last spells + a snapshot of `/lol-perks/v1/currentpage`.
+- **Locked rows pin the spell pair.** `record_loadout` uses `CASE WHEN loadout.locked` so a locked pair survives session end (count/last_seen/runes still update). `set_locked(..., spell1, spell2)` with a non-zero pair *replaces* the pair ("lock these"); zeros pin the stored pair unchanged; unlocking never touches spells.
+- **Auto-apply** (`_maybe_auto_apply`) runs on the EventStream thread on every session frame: when the picked champion has a locked row and the selected pair differs, it `PATCH`es `/my-selection` **once per champion per champ select** (`_auto_apply_seen`, cleared on `Delete`/disconnect). After that the user's manual changes win. The GUI calls `forget_auto_apply` when the lock toggles mid-select so a fresh lock applies immediately.
+- `apply_spells` (spells only) is split from `apply_loadout` (spells + runes) so the auto path never rewrites the rune page.
+
+In the GUI, `LoadoutPanel` renders a live "Now: D = …, F = …" line from `cell.spell1Id/spell2Id` on every frame (green = matches saved, orange = differs) and "(hovering)"/"(locked in)" from `pick_locked_in` — the local player's *completed* pick action, since `championId` is set on select, before the lock-in click. The identical-frame short-circuit must compare champ + spells + pick state, and must not fire on the first frame of a session (`_in_session`), or the panel stays hidden until a champion is picked.
 
 ### GUI threading model
 
