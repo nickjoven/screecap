@@ -1,0 +1,4 @@
+# Store and check out LF; overrides Git for Windows autocrlf=true. *.bat/*.cmd stay CRLF.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
