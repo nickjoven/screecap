@@ -4,6 +4,7 @@ import logging
 import signal
 import sys
 
+import highlights
 import logging_setup
 from preflight import (
     ENCODER_CHOICES,
@@ -40,6 +41,11 @@ def parse_args():
                    help="Print available dshow audio devices, then exit.")
     p.add_argument("--check", action="store_true",
                    help="Run preflight only, then exit. Useful for setup verification.")
+    p.add_argument("--cut-highlights", action="store_true",
+                   help="After recording, cut highlight clips from the markers the "
+                        "recording collected (League events). See highlights.py.")
+    p.add_argument("--no-league-markers", action="store_true",
+                   help="Do not poll the League Live Client for highlight markers.")
     p.add_argument("--stop-on-match-end", action="store_true",
                    help="Watch the League gameflow phase and stop recording when "
                         "the match ends (transition out of 'InProgress'). Requires "
@@ -157,6 +163,16 @@ def main():
 
     signal.signal(signal.SIGINT, lambda *_: recorder.request_stop())
 
+    # Highlight markers: League Live Client events land in <output>.highlights.json
+    # as video timestamps while we record. Nothing is written if none occur.
+    sidecar = highlights.Sidecar(args.output)
+    tagger = highlights.Tagger(
+        sidecar,
+        clock=lambda: recorder.elapsed if recorder.start_time else None,
+        league_events=not args.no_league_markers,
+    )
+    tagger.start()
+
     lcu_stream = None
     if args.stop_on_match_end:
         lcu_stream = _start_match_end_watcher(recorder, log)
@@ -166,12 +182,23 @@ def main():
     try:
         recorder.run()
     finally:
+        tagger.stop(timeout=2.0)
         if lcu_stream is not None:
             lcu_stream.stop(timeout=2.0)
         recorder.shutdown()
 
     print(f"\nWrote {recorder.frame_count} frames in {recorder.elapsed:.1f}s "
           f"({recorder.avg_fps:.1f} fps avg) -> {args.output}")
+    if sidecar.markers:
+        print(f"{len(sidecar.markers)} highlight marker(s) -> {sidecar.path}")
+        if args.cut_highlights:
+            try:
+                res = highlights.cut_highlights(args.output, sidecar)
+                print(f"  {len(res.clips)} clip(s) via {res.encoder} -> {res.out_dir}")
+            except RuntimeError as e:
+                print(f"  highlight cut failed: {e}", file=sys.stderr)
+        else:
+            print(f"  cut them with: python highlights.py \"{args.output}\"")
     ok, detail = recorder.health()
     if not ok:
         print(f"Note: {detail}", file=sys.stderr)

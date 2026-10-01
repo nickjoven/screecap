@@ -25,6 +25,9 @@ AUDIO_RTBUFSIZE = "256M"
 # (e.g. get_latest_frame() blocked), never a slow-but-alive recording.
 STALL_TIMEOUT = 30.0
 
+# GOP length in seconds (-g = fps * this). See the comment at the -g flag.
+KEYFRAME_INTERVAL_S = 2.0
+
 # The dshow "real-time buffer too full ... ! frame dropped!" line is our
 # xrun signal: every match is irrecoverably lost audio. ffmpeg's logger
 # collapses runs of it into "Last message repeated N times", so count both.
@@ -122,6 +125,11 @@ class Recorder:
                 "-i", f"audio={dev}",
             ]
         cmd += encoder_args(self.encoder)
+        # Keyframe every KEYFRAME_INTERVAL_S so highlight cuts (highlights.py)
+        # that stream-copy land within that distance of the marker. Encoder
+        # defaults are ~4 s (250 frames) and -g is honoured by every encoder
+        # in ENCODER_PRIORITY. Costs a little bitrate on static screens.
+        cmd += ["-g", str(max(1, int(self.fps * KEYFRAME_INTERVAL_S)))]
         n_audio = len(self.audio_devices)
         if n_audio == 1:
             cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]

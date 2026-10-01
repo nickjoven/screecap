@@ -28,6 +28,7 @@ Engine + front-ends + integration layer:
 preflight.py            checks + encoder selection + device enumeration   (UI-agnostic)
 recorder.py             Recorder engine: dxcam capture -> ffmpeg pipe     (UI-agnostic)
 league/                 LCU (REST + WebSocket) and Live Client Data       (UI-agnostic)
+highlights.py           Tagger (markers beside the Recorder) + cut       (UI-agnostic)
 loadouts.py             Per-champion spell/rune memory, spell lock, apply   (UI-agnostic)
 record.py               CLI front-end (argparse, signal.SIGINT)
 gui.py                  PyQt6 front-end (worker thread, hotkey, tray icon)
@@ -76,6 +77,36 @@ Hard rules:
 - **`recorder.health()` is the post-record quality verdict, distinct from `recorder.error`.** `error` = hard failure. `health()` catches the class an `rc=0` ffmpeg hides: a valid file with a gappy/silent audio track. It keys off `audio_drops`, tallied from the dshow "frame dropped" stderr lines (and their "Last message repeated N times" collapses) in `_pump_ffmpeg_stderr` — an xrun counter. Both front-ends surface it: the CLI exits `3` (vs `2` for hard error) on degraded; the GUI shows an advisory "audio degraded" warning, not the red "Error" state. Don't route degradation through `error` — it is advisory, not fatal.
 - **`request_stop()` is signal-safe and non-blocking.** `shutdown()` is the blocking finalizer. They are separate so the CLI's SIGINT handler can call only `request_stop()`.
 - **Multi-device audio uses `-filter_complex amix=inputs=N:duration=shortest`** with explicit `-map 0:v -map [aout]`. The `[N:a]` indices are 1-based against the audio inputs because input `0` is the raw video pipe. Adding the filter only when N>1 keeps the single-device path simple.
+
+### Highlights: sidecar between the during and after halves
+
+`highlights.Tagger` runs beside the `Recorder` (CLI and GUI both construct it
+right after the `Recorder`; the GUI starts it in `_on_capture_started` so the
+clock is valid) and appends `Marker`s to `<output>.highlights.json`, rewritten
+atomically on every add. `highlights.cut_highlights()` reads that file after
+`shutdown()` and drives ffmpeg. Rules that keep it honest:
+
+- **Markers are in video seconds, never game seconds.** The Tagger's `clock`
+  is `recorder.elapsed`; a Live Client event is mapped the moment it is first
+  seen as `now_video - (gameTime_now - EventTime)`. Polling is ~1 s, so this is
+  accurate to the poll and immune to earlier in-game pauses. Events whose
+  mapped time is negative (match already running when recording began) are
+  dropped.
+- **Identity is a set of spellings.** Event fields (`KillerName` etc.) are
+  "GameName#TAG" on current patches and the bare summoner name on older ones;
+  `_name_variants()` collects every form from `activeplayer` / `playerlist`.
+  Team membership (for objective events) comes from `playerlist.team`.
+- **`-g fps*KEYFRAME_INTERVAL_S` in the recorder exists for the copy mode.**
+  Default GOPs are ~4 s; 2 s bounds how early a stream-copied clip starts.
+  Re-encode mode (the default) reuses `preflight.encoder_args` and is
+  frame-accurate; `preflight` is imported lazily inside `cut_highlights` so
+  `highlights.py` itself imports without dxcam (its unit tests run anywhere).
+- **The GUI cuts in `HighlightWorker` on a `QThread`, never inline.** Same
+  thread rules as `CaptureWorker`: no `wait()` from the finished slot;
+  references are nulled in `_on_hl_thread_finished`.
+- **One pynput listener serves both hotkeys** (`_install_hotkey_listener`).
+  `_set_mark_hotkey` refuses a key equal to the record hotkey. Settings keys:
+  `hotkey/mark`, `highlights/auto_cut`, `highlights/fast`.
 
 ### Loadout memory and spell lock
 

@@ -30,5 +30,11 @@ def liveclient_active_player() -> Optional[dict]:
     return _liveclient_get("/liveclientdata/activeplayer")
 
 
+def liveclient_player_list() -> Optional[list]:
+    """All ten players with `team` ("ORDER"/"CHAOS"), names and champion."""
+    payload = _liveclient_get("/liveclientdata/playerlist")
+    return payload if isinstance(payload, list) else None
+
+
 def liveclient_game_data() -> Optional[dict]:
     return _liveclient_get("/liveclientdata/gamestats")

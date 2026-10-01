@@ -18,6 +18,7 @@ from .liveclient import (
     liveclient_active_player,
     liveclient_events,
     liveclient_game_data,
+    liveclient_player_list,
 )
 from .lockfile import (
     Lockfile,
@@ -38,4 +39,5 @@ __all__ = [
     "liveclient_active_player",
     "liveclient_events",
     "liveclient_game_data",
+    "liveclient_player_list",
 ]

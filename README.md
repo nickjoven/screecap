@@ -57,6 +57,15 @@ python record.py --audio "Microphone" --audio "Stereo Mix"  # mix two sources
 - **Audio**: capture from any dshow device; tick multiple devices in the GUI (or repeat `--audio` on the CLI) to mix mic + system audio into one track via ffmpeg's `amix` filter.
 - **Region selection**: numeric inputs, or click-and-drag a transparent overlay on the chosen monitor.
 - **Global hotkey**: rebindable, default F9, works while another window has focus.
+- **Highlights**: while recording, League Live Client events that involve you (kills, deaths, assists, multikills, first blood, aces, your team's dragon/baron/herald/inhibitor takes, your turret kills) and presses of the **mark hotkey** (default **F10**) are written as video timestamps to `<recording>.highlights.json`. When the recording ends, each moment becomes a clip (10 s before, 5 s after, overlapping moments merged) plus a combined `highlights.mp4`, in `<recording>_highlights\` next to the file. Re-encoded with the recording encoder for frame-accurate cuts; **Fast cut** stream-copies instead (instant, snaps to the 2 s keyframe grid). Works for any recording via the mark hotkey; League events need the League connection on.
+
+```powershell
+python highlights.py recording.mp4            # cut from the sidecar written during recording
+python highlights.py recording.mp4 --list     # show markers and windows only
+python highlights.py recording.mp4 --copy     # keyframe-snapped, no re-encode
+python highlights.py recording.mp4 --mark 83 "nice play"   # add a marker by hand
+python record.py --cut-highlights             # CLI: cut automatically after recording
+```
 
 ## League of Legends integration
 

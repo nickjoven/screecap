@@ -7,6 +7,7 @@ import sys
 
 from PyQt6 import QtCore, QtGui, QtNetwork, QtWidgets
 
+import highlights
 import league
 import loadouts
 import logging_setup
@@ -56,6 +57,7 @@ class HotkeyBridge(QtCore.QObject):
     Qt automatically uses QueuedConnection across threads.
     """
     toggle_pressed = QtCore.pyqtSignal()
+    mark_pressed = QtCore.pyqtSignal()
 
 
 def _format_pynput_key(key) -> str:
@@ -895,6 +897,32 @@ class CaptureWorker(QtCore.QObject):
         )
 
 
+class HighlightWorker(QtCore.QObject):
+    """Runs highlights.cut_highlights() off the GUI thread.
+
+    Emits finished(result_or_none, error_or_none). ffmpeg re-encodes each
+    window, which can take tens of seconds for a long game, so this must
+    never run on the GUI thread.
+    """
+    finished = QtCore.pyqtSignal(object, object)
+
+    def __init__(self, video: str, sidecar: "highlights.Sidecar", mode: str):
+        super().__init__()
+        self.video = video
+        self.sidecar = sidecar
+        self.mode = mode
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            res = highlights.cut_highlights(self.video, self.sidecar, mode=self.mode)
+        except Exception as e:
+            log.exception("highlight cut failed")
+            self.finished.emit(None, str(e))
+            return
+        self.finished.emit(res, None)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -915,6 +943,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # ignore phase transitions so the user keeps full control.
         self._auto_started = False
 
+        # Highlights: a Tagger writes markers beside the recording; after it
+        # ends a HighlightWorker cuts them. See highlights.py.
+        self._sidecar: "highlights.Sidecar | None" = None
+        self._tagger: "highlights.Tagger | None" = None
+        self._hl_thread: "QtCore.QThread | None" = None
+        self._hl_worker: "HighlightWorker | None" = None
+        self._last_highlights_dir: "str | None" = None
+
         # Tray-icon state. closeEvent hides the window unless _really_quit is
         # set by the tray's Quit action (or by closeEvent's own re-entry path
         # if the tray isn't available, so X still works as a quit fallback).
@@ -934,6 +970,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_audio_devices()
         self._load_on_exist_pref()
         self._load_auto_record_pref()
+        self._load_highlight_prefs()
         self._load_persistent_prefs()
         self._build_tray()
 
@@ -942,15 +979,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.poll_timer.timeout.connect(self._poll_metrics)
 
         self._hotkey_target = None
+        self._mark_hotkey_target = None
         self._listener = None
         self._hotkey_bridge = None
         if _pynput_keyboard is not None:
             self._hotkey_bridge = HotkeyBridge()
             self._hotkey_bridge.toggle_pressed.connect(self._toggle_record)
+            self._hotkey_bridge.mark_pressed.connect(self._on_mark_pressed)
             self._set_hotkey(self._load_hotkey_pref() or _pynput_keyboard.Key.f9)
+            self._set_mark_hotkey(
+                self._load_hotkey_pref("hotkey/mark") or _pynput_keyboard.Key.f10)
         else:
             self.hotkey_btn.setText("(pynput missing)")
             self.hotkey_btn.setEnabled(False)
+            self.hotkey_mark_btn.setText("(pynput missing)")
+            self.hotkey_mark_btn.setEnabled(False)
             self.statusBar().showMessage(
                 "Install 'pynput' to enable global hotkeys (pip install pynput)."
             )
@@ -1052,6 +1095,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hotkey_btn.setToolTip("Click to change the global toggle hotkey.")
         self.hotkey_btn.clicked.connect(self._capture_hotkey)
         hotkey_row.addWidget(self.hotkey_btn)
+        hotkey_row.addSpacing(12)
+        hotkey_row.addWidget(QtWidgets.QLabel("Mark highlight:"))
+        self.hotkey_mark_btn = QtWidgets.QPushButton("F10")
+        self.hotkey_mark_btn.setToolTip(
+            "Click to change the global 'mark highlight' hotkey.\n"
+            "Pressing it while recording drops a marker at the current moment;\n"
+            "the clip around it is cut when the recording ends."
+        )
+        self.hotkey_mark_btn.clicked.connect(self._capture_mark_hotkey)
+        hotkey_row.addWidget(self.hotkey_mark_btn)
         hotkey_row.addStretch()
         form.addRow("Hotkey:", hotkey_row)
 
@@ -1084,6 +1137,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_record_check.toggled.connect(self._toggle_auto_record)
         form.addRow("Auto-record:", self.auto_record_check)
 
+        hl_row = QtWidgets.QHBoxLayout()
+        self.auto_cut_check = QtWidgets.QCheckBox("Cut after recording")
+        self.auto_cut_check.setToolTip(
+            "When a recording ends with highlight markers (League kills, deaths,\n"
+            "multikills, objectives, or the mark hotkey), cut one clip per moment\n"
+            "plus a combined reel into <recording>_highlights\\ next to the file."
+        )
+        self.auto_cut_check.toggled.connect(self._save_auto_cut_pref)
+        self.hl_fast_check = QtWidgets.QCheckBox("Fast cut")
+        self.hl_fast_check.setToolTip(
+            "Stream-copy instead of re-encoding: instant, but each clip starts on\n"
+            "the nearest keyframe (up to 2 s early). Off = frame-accurate re-encode\n"
+            "with the recording encoder."
+        )
+        self.hl_fast_check.toggled.connect(self._save_hl_fast_pref)
+        hl_row.addWidget(self.auto_cut_check)
+        hl_row.addWidget(self.hl_fast_check)
+        hl_row.addStretch()
+        form.addRow("Highlights:", hl_row)
+
         self.loadout_panel = LoadoutPanel()
         form.addRow(self.loadout_panel)
 
@@ -1099,8 +1172,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_in_folder_btn.setEnabled(False)
         self.open_btn.clicked.connect(self._open_last_output)
         self.show_in_folder_btn.clicked.connect(self._show_last_output_in_folder)
+        self.highlights_btn = QtWidgets.QPushButton("Highlights")
+        self.highlights_btn.setEnabled(False)
+        self.highlights_btn.clicked.connect(self._on_highlights_btn)
         result_row.addWidget(self.open_btn)
         result_row.addWidget(self.show_in_folder_btn)
+        result_row.addWidget(self.highlights_btn)
         result_row.addStretch()
         form.addRow("", result_row)
 
@@ -1291,11 +1368,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for name, spin in self.region_inputs.items():
             self._settings.setValue(f"region/{name}", spin.value())
 
-    def _load_hotkey_pref(self):
+    def _load_hotkey_pref(self, setting: str = "hotkey/target"):
         """Deserialize the saved hotkey into a pynput Key/KeyCode, or None."""
         if _pynput_keyboard is None:
             return None
-        s = self._settings.value("hotkey/target", "", type=str)
+        s = self._settings.value(setting, "", type=str)
         if not s:
             return None
         kind, _, value = s.partition(":")
@@ -1308,15 +1385,31 @@ class MainWindow(QtWidgets.QMainWindow):
             return _pynput_keyboard.KeyCode.from_char(value)
         return None
 
-    def _save_hotkey_pref(self, key):
+    def _save_hotkey_pref(self, key, setting: str = "hotkey/target"):
         if _pynput_keyboard is None or key is None:
             return
         if isinstance(key, _pynput_keyboard.Key):
-            self._settings.setValue("hotkey/target", f"key:{key.name}")
+            self._settings.setValue(setting, f"key:{key.name}")
         else:
             char = getattr(key, "char", None)
             if char:
-                self._settings.setValue("hotkey/target", f"char:{char}")
+                self._settings.setValue(setting, f"char:{char}")
+
+    def _load_highlight_prefs(self):
+        self.auto_cut_check.blockSignals(True)
+        self.hl_fast_check.blockSignals(True)
+        self.auto_cut_check.setChecked(
+            self._settings.value("highlights/auto_cut", True, type=bool))
+        self.hl_fast_check.setChecked(
+            self._settings.value("highlights/fast", False, type=bool))
+        self.auto_cut_check.blockSignals(False)
+        self.hl_fast_check.blockSignals(False)
+
+    def _save_auto_cut_pref(self, enabled: bool):
+        self._settings.setValue("highlights/auto_cut", enabled)
+
+    def _save_hl_fast_pref(self, enabled: bool):
+        self._settings.setValue("highlights/fast", enabled)
 
     def _load_auto_record_pref(self):
         # QSettings.value with type=bool handles the str-vs-bool quirk on Windows.
@@ -1819,6 +1912,15 @@ class MainWindow(QtWidgets.QMainWindow):
             encoder=encoder,
             audio_devices=args["audio_devices"],
         )
+        # Marker collection runs beside the recorder; started once capture is
+        # live (so the clock is valid), stopped in _on_capture_finished.
+        self._sidecar = highlights.Sidecar(args["output"])
+        rec = self.recorder
+        self._tagger = highlights.Tagger(
+            self._sidecar,
+            clock=lambda: rec.elapsed if rec.start_time else None,
+            league_events=self.lcu_check.isChecked(),
+        )
         self.thread = QtCore.QThread(self)
         self.worker = CaptureWorker(self.recorder)
         self.worker.moveToThread(self.thread)
@@ -1853,11 +1955,16 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Recording {width}x{height} @ {self.fps_spin.value()}fps -> {out}"
         )
         self.poll_timer.start()
+        if self._tagger is not None:
+            self._tagger.start()
         self._update_tray_state()
 
     @QtCore.pyqtSlot(int, float, object)
     def _on_capture_finished(self, frames: int, elapsed: float, error):
         self.poll_timer.stop()
+        tagger, self._tagger = self._tagger, None
+        if tagger is not None:
+            tagger.stop(timeout=2.0)
         avg = (frames / elapsed) if elapsed > 0 else 0.0
         output_path = self.recorder.output if self.recorder else None
         ok, detail = (
@@ -1907,6 +2014,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_btn.setText("● Record")
         self.record_btn.setEnabled(True)
         self._set_inputs_enabled(True)
+        if not error and output_path and os.path.exists(output_path):
+            self._after_recording_highlights(output_path)
 
     @QtCore.pyqtSlot()
     def _on_thread_finished(self):
@@ -1915,6 +2024,96 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recorder = None
         self._auto_started = False
         self._update_tray_state()
+
+    # ---- highlights -------------------------------------------------------
+
+    def _after_recording_highlights(self, output_path: str):
+        """Decide what to do with the sidecar once a recording has finished."""
+        self._last_highlights_dir = None
+        sidecar = highlights.Sidecar.load_if_present(output_path)
+        n = len(sidecar.markers) if sidecar else 0
+        log.info("recording ended with %d highlight marker(s)", n)
+        if not n:
+            self.highlights_btn.setEnabled(False)
+            self.highlights_btn.setText("Highlights")
+            return
+        self.highlights_btn.setEnabled(True)
+        self.highlights_btn.setText(f"Cut {n} highlight(s)")
+        if self.auto_cut_check.isChecked():
+            self._cut_highlights(output_path, sidecar)
+
+    def _cut_highlights(self, video: str, sidecar: "highlights.Sidecar"):
+        if self._hl_thread is not None:
+            self.statusBar().showMessage("A highlight cut is already running.", 3000)
+            return
+        mode = "copy" if self.hl_fast_check.isChecked() else "reencode"
+        n = len(sidecar.markers)
+        log.info("cutting %d highlight marker(s) from %s (mode=%s)", n, video, mode)
+        self.status_label.setText(f"Cutting {n} highlight(s)...")
+        self.highlights_btn.setEnabled(False)
+        self._hl_thread = QtCore.QThread(self)
+        self._hl_worker = HighlightWorker(video, sidecar, mode)
+        self._hl_worker.moveToThread(self._hl_thread)
+        self._hl_thread.started.connect(self._hl_worker.run)
+        self._hl_worker.finished.connect(self._on_highlights_done)
+        self._hl_worker.finished.connect(self._hl_thread.quit)
+        self._hl_thread.finished.connect(self._on_hl_thread_finished)
+        self._hl_thread.start()
+
+    @QtCore.pyqtSlot(object, object)
+    def _on_highlights_done(self, result, error):
+        if error:
+            self.status_label.setText("Highlights failed (see log)")
+            self.statusBar().showMessage(f"Highlights: {error}", 8000)
+            self.highlights_btn.setEnabled(True)
+            return
+        self._last_highlights_dir = result.out_dir
+        n = len(result.clips)
+        self.status_label.setText(
+            f"Done -> {os.path.basename(result.reel or result.out_dir)}"
+            f" ({n} highlight clip{'s' if n != 1 else ''}, {result.encoder})"
+        )
+        self.highlights_btn.setText("Highlights folder")
+        self.highlights_btn.setEnabled(True)
+        if self.tray is not None:
+            self.tray.showMessage(
+                "Highlights ready",
+                f"{n} clip{'s' if n != 1 else ''} -> {os.path.basename(result.out_dir)}",
+                QtWidgets.QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )
+
+    @QtCore.pyqtSlot()
+    def _on_hl_thread_finished(self):
+        self._hl_thread = None
+        self._hl_worker = None
+
+    def _on_highlights_btn(self):
+        if self._last_highlights_dir and os.path.isdir(self._last_highlights_dir):
+            try:
+                os.startfile(self._last_highlights_dir)  # noqa: S606 (Windows-only app)
+            except OSError:
+                log.exception("could not open highlights folder")
+            return
+        video = self._last_output_path
+        if not video or not os.path.exists(video):
+            return
+        sidecar = highlights.Sidecar.load_if_present(video)
+        if sidecar and sidecar.markers:
+            self._cut_highlights(video, sidecar)
+
+    @QtCore.pyqtSlot()
+    def _on_mark_pressed(self):
+        tagger = self._tagger
+        if tagger is None or self.recorder is None:
+            self.statusBar().showMessage("Mark highlight: not recording.", 2000)
+            return
+        m = tagger.mark()
+        if m is None:
+            self.statusBar().showMessage("Mark highlight: capture not live yet.", 2000)
+            return
+        t = int(m.t)
+        self.statusBar().showMessage(f"Highlight marked at {t // 60}m{t % 60:02d}s", 3000)
 
     def _open_last_output(self):
         if self._last_output_path and os.path.exists(self._last_output_path):
@@ -1953,30 +2152,52 @@ class MainWindow(QtWidgets.QMainWindow):
             self.audio_test_btn.setEnabled(on and audio_populated)
         if hasattr(self, "hotkey_btn"):
             self.hotkey_btn.setEnabled(on)
+        if hasattr(self, "hotkey_mark_btn"):
+            self.hotkey_mark_btn.setEnabled(on)
 
-    def _set_hotkey(self, key):
-        """Install (or replace) the global listener for the given pynput key."""
-        if _pynput_keyboard is None:
-            return
+    def _install_hotkey_listener(self):
+        """(Re)build the single pynput listener for both global hotkeys."""
         if self._listener is not None:
             self._listener.stop()
             self._listener = None
-        self._hotkey_target = key
         bridge = self._hotkey_bridge
-        target = key
+        toggle, mark = self._hotkey_target, self._mark_hotkey_target
 
         def on_press(k):
-            if _pynput_keys_match(k, target):
+            if toggle is not None and _pynput_keys_match(k, toggle):
                 bridge.toggle_pressed.emit()
+            elif mark is not None and _pynput_keys_match(k, mark):
+                bridge.mark_pressed.emit()
 
         self._listener = _pynput_keyboard.Listener(on_press=on_press)
         self._listener.daemon = True
         self._listener.start()
+
+    def _set_hotkey(self, key):
+        """Install (or replace) the global record-toggle hotkey."""
+        if _pynput_keyboard is None:
+            return
+        self._hotkey_target = key
+        self._install_hotkey_listener()
         label = _format_pynput_key(key)
         self.hotkey_btn.setText(label)
         self.record_btn.setToolTip(f"{label} toggles recording globally.")
         self.statusBar().showMessage(f"Global hotkey: {label}")
         self._save_hotkey_pref(key)
+
+    def _set_mark_hotkey(self, key):
+        """Install (or replace) the global 'mark highlight' hotkey."""
+        if _pynput_keyboard is None:
+            return
+        if self._hotkey_target is not None and _pynput_keys_match(key, self._hotkey_target):
+            self.statusBar().showMessage(
+                "Mark hotkey must differ from the record hotkey.", 4000)
+            return
+        self._mark_hotkey_target = key
+        self._install_hotkey_listener()
+        label = _format_pynput_key(key)
+        self.hotkey_mark_btn.setText(label)
+        self._save_hotkey_pref(key, "hotkey/mark")
 
     def _capture_hotkey(self):
         if _pynput_keyboard is None:
@@ -1992,6 +2213,23 @@ class MainWindow(QtWidgets.QMainWindow):
         new_target = dlg.captured_key if (accepted and dlg.captured_key) else previous
         if new_target is not None:
             self._set_hotkey(new_target)
+        else:
+            self._install_hotkey_listener()
+
+    def _capture_mark_hotkey(self):
+        if _pynput_keyboard is None:
+            return
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+        previous = self._mark_hotkey_target
+        dlg = HotkeyCaptureDialog(self)
+        accepted = dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted
+        new_target = dlg.captured_key if (accepted and dlg.captured_key) else previous
+        if new_target is not None:
+            self._set_mark_hotkey(new_target)
+        else:
+            self._install_hotkey_listener()
 
     def closeEvent(self, event):
         # Hide-to-tray when the user clicks the X. Only the tray's "Quit"
