@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+import ledger
+
 try:
     import psutil
 except ImportError:
@@ -56,11 +58,15 @@ def _candidate_lockfile_paths() -> List[Path]:
 def find_lockfile_via_paths() -> Optional[Lockfile]:
     for path in _candidate_lockfile_paths():
         if path.is_file():
+            entry = ledger.begin("read", str(path),
+                                 "League lockfile: port + auth token (token never written here)")
             try:
                 lf = _parse_lockfile_text(path.read_text(encoding="utf-8"))
+                entry.ok(f"port={lf.port}")
                 log.debug("lockfile from path: %s", path)
                 return lf
             except (OSError, ValueError) as e:
+                entry.err(str(e))
                 log.warning("could not read lockfile %s: %s", path, e)
     return None
 
@@ -86,6 +92,9 @@ def find_lockfile_via_process() -> Optional[Lockfile]:
                     password = arg.split("=", 1)[1]
             if port and password:
                 log.debug("lockfile from process pid=%s", proc.info["pid"])
+                ledger.begin("read", f"process:{name} pid={proc.info['pid']}",
+                             "command line: --app-port and --remoting-auth-token "
+                             "(token never written here)").ok(f"port={port}")
                 return Lockfile(pid=proc.info["pid"], port=port, password=password)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue

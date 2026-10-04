@@ -4,6 +4,8 @@ import os
 import re
 import shutil
 import subprocess
+
+import ledger
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,7 +34,7 @@ def check_ffmpeg() -> Check:
             "  and add its bin/ folder to PATH (the 'essentials' build lacks libx264).",
         )
     try:
-        out = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=5)
+        out = ledger.run([path, "-version"], capture_output=True, text=True, timeout=5)
         version = out.stdout.splitlines()[0] if out.stdout else "unknown version"
     except Exception as e:
         return Check(False, "ffmpeg", f"found at {path} but failed to run: {e}",
@@ -42,7 +44,7 @@ def check_ffmpeg() -> Check:
 
 def check_encoder_listed(encoder: str) -> Check:
     try:
-        out = subprocess.run(
+        out = ledger.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=5,
         )
@@ -77,7 +79,7 @@ def probe_encoder(encoder: str) -> Check:
         "-f", "null", "-",
     ]
     try:
-        proc = subprocess.run(cmd, input=b"\x00" * (w * h * 3),
+        proc = ledger.run(cmd, input=b"\x00" * (w * h * 3),
                               capture_output=True, timeout=10)
     except Exception as e:
         return Check(False, f"probe:{encoder}", f"probe failed to launch: {e}",
@@ -194,7 +196,7 @@ def list_audio_devices() -> list:
     ffmpeg even when devices exist.
     """
     try:
-        proc = subprocess.run(
+        proc = ledger.run(
             ["ffmpeg", "-hide_banner", "-f", "dshow", "-list_devices", "true",
              "-i", "dummy"],
             capture_output=True, text=True, timeout=10,
@@ -241,7 +243,7 @@ def probe_audio_device(name: str) -> Check:
         "-t", "0.1", "-f", "null", "-",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=10)
+        proc = ledger.run(cmd, capture_output=True, timeout=10)
     except Exception as e:
         return Check(False, f"audio:{name}", f"probe failed to launch: {e}",
                      "Check that ffmpeg runs (`ffmpeg -version`).")
@@ -313,7 +315,7 @@ def measure_audio_levels(name: str, duration_s: float = 3.0) -> AudioLevels:
         "-af", "volumedetect", "-f", "null", "-",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=duration_s + 15)
+        proc = ledger.run(cmd, capture_output=True, timeout=duration_s + 15)
     except subprocess.TimeoutExpired:
         return AudioLevels(False, None, None, "ffmpeg timed out")
     except Exception as e:

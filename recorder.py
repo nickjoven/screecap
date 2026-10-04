@@ -1,11 +1,13 @@
 """Recording engine: DXGI capture -> ffmpeg encode. UI-agnostic."""
 import logging
+import os
 import re
 import subprocess
 import threading
 import time
 from typing import List, Optional, Tuple
 
+import ledger
 import dxcam
 
 from preflight import encoder_args
@@ -90,14 +92,19 @@ class Recorder:
             self.output, self.fps, self.monitor, self.region, self.encoder,
             self.duration, self.audio_devices,
         )
+        cam_entry = ledger.begin(
+            "read", f"screen:monitor{self.monitor}",
+            f"DXGI Desktop Duplication, {self.fps} fps, region={self.region or 'full'}")
         cam = dxcam.create(output_idx=self.monitor, output_color="BGR")
         if cam is None:
+            cam_entry.err("no DXGI output at that monitor index")
             raise RuntimeError(f"No DXGI output at monitor index {self.monitor}")
         self._camera = cam
         self._camera.start(target_fps=self.fps, video_mode=True, region=self.region)
 
         first = self._camera.get_latest_frame()
         self.height, self.width = first.shape[:2]
+        cam_entry.ok(f"{self.width}x{self.height}")
         log.info("dxcam started: %dx%d", self.width, self.height)
 
         cmd = [
@@ -151,6 +158,9 @@ class Recorder:
         cmd += ["-fps_mode", "vfr"]
         cmd += [self.output]
         log.info("ffmpeg cmd: %s", subprocess.list2cmdline(cmd))
+        # Announced before launch; answered in shutdown() with the exit code.
+        self._ledger_ffmpeg = ledger.begin("exec", "ffmpeg", subprocess.list2cmdline(cmd))
+        self._ledger_output = ledger.begin("write", self.output, "MP4 output (ffmpeg writes it)")
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
         )
@@ -260,12 +270,14 @@ class Recorder:
             try:
                 rc = self._proc.wait(timeout=finalize_timeout)
                 log.info("ffmpeg exited rc=%d", rc)
+                self._answer_ledger(rc)
             except subprocess.TimeoutExpired:
                 log.warning("ffmpeg did not finalize in %.0fs; killing", finalize_timeout)
                 self._proc.kill()
                 self._proc.wait()
                 self.error = (self.error or "") + \
                     f" (ffmpeg did not finalize in {finalize_timeout:.0f}s; output may be unplayable)"
+                self._answer_ledger(None)
         if self._watchdog_thread is not None:
             # request_stop() above already set _stop; the watchdog wakes
             # from its <=1 s wait and exits on its own.
@@ -273,6 +285,31 @@ class Recorder:
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2.0)
         log.info("shutdown done")
+
+    def _answer_ledger(self, rc):
+        """Close the exec/write ledger entries opened in start()."""
+        ffm = getattr(self, "_ledger_ffmpeg", None)
+        out = getattr(self, "_ledger_output", None)
+        if ffm is None:
+            return
+        try:
+            size = os.path.getsize(self.output)
+        except OSError:
+            size = 0
+        summary = (f"{self.frame_count} frames, {self.elapsed:.1f}s, "
+                   f"{self.avg_fps:.1f} fps avg, {size / 1e6:.1f} MB")
+        if rc is None:
+            ffm.err(f"killed after finalize timeout; {summary}")
+            if out is not None:
+                out.err("may be unplayable (no moov atom)")
+        elif rc == 0:
+            ffm.ok(f"rc=0, {summary}")
+            if out is not None:
+                out.ok(f"{size / 1e6:.1f} MB")
+        else:
+            ffm.err(f"rc={rc}, {summary}")
+            if out is not None:
+                out.err(f"ffmpeg rc={rc}")
 
     def _pump_ffmpeg_stderr(self, stream):
         """Forward ffmpeg's stderr to the logger and tally audio xruns.

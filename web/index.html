@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>screecap ledger</title>
+<style>
+:root {
+  --bg: #fafaf8; --fg: #1a1a1a; --mute: #6b6b66; --line: #e3e2dd; --panel: #f1f0eb;
+  --exec: #0b7285; --http: #3b5bdb; --read: #868e96; --write: #b7791f; --api: #2b8a3e;
+  --listen: #862e9c; --ok: #2b8a3e; --err: #c92a2a; --note: #868e96; --hl: #fff3bf;
+  --rec: #c92a2a;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121311; --fg: #e8e6e1; --mute: #8d8b84; --line: #2a2b28; --panel: #1b1c19;
+  --exec: #66d9e8; --http: #91a7ff; --read: #868e96; --write: #ffd43b; --api: #8ce99a;
+  --listen: #e599f7; --ok: #8ce99a; --err: #ff8787; --note: #868e96; --hl: #3b3a1f;
+}}
+:root[data-theme="dark"] {
+  --bg: #121311; --fg: #e8e6e1; --mute: #8d8b84; --line: #2a2b28; --panel: #1b1c19;
+  --exec: #66d9e8; --http: #91a7ff; --read: #868e96; --write: #ffd43b; --api: #8ce99a;
+  --listen: #e599f7; --ok: #8ce99a; --err: #ff8787; --note: #868e96; --hl: #3b3a1f;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 13px/1.45 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+  display: flex; flex-direction: column; }
+header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+.chip { padding: 2px 8px; border: 1px solid var(--line); border-radius: 4px; color: var(--mute);
+  white-space: nowrap; max-width: 46ch; overflow: hidden; text-overflow: ellipsis; }
+.chip.on { color: var(--fg); border-color: var(--fg); }
+.chip.rec { color: var(--rec); border-color: var(--rec); font-weight: 600; }
+.chip.rec::before { content: "● "; }
+.spacer { flex: 1; }
+button { font: inherit; padding: 4px 10px; border: 1px solid var(--fg); border-radius: 4px;
+  background: transparent; color: var(--fg); cursor: pointer; }
+button:hover { background: var(--line); }
+button.primary { background: var(--fg); color: var(--bg); }
+button:disabled { opacity: .5; cursor: default; }
+details.manifest { padding: 8px 16px; border-bottom: 1px solid var(--line); color: var(--mute); }
+details.manifest summary { cursor: pointer; color: var(--fg); }
+details.manifest .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 4px 24px; margin-top: 6px; }
+details.manifest h3 { margin: 4px 0 2px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--fg); }
+details.manifest ul { margin: 0; padding-left: 18px; }
+details.manifest .paths { margin-top: 6px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center;
+  padding: 6px 16px; border-bottom: 1px solid var(--line); color: var(--mute); }
+.toolbar input[type=text] { font: inherit; padding: 3px 6px; border: 1px solid var(--line);
+  border-radius: 4px; background: var(--bg); color: var(--fg); min-width: 24ch; }
+.toolbar label { display: inline-flex; gap: 3px; align-items: center; cursor: pointer; }
+main { flex: 1; display: flex; min-height: 0; }
+#log { flex: 1; overflow: auto; padding: 4px 16px 24px; }
+table { border-collapse: collapse; width: 100%; }
+td { padding: 1px 10px 1px 0; vertical-align: top; }
+td.ts { color: var(--mute); white-space: nowrap; }
+td.seq { color: var(--mute); text-align: right; white-space: nowrap; }
+td.kind { font-weight: 600; white-space: nowrap; }
+td.target { white-space: nowrap; max-width: 46ch; overflow: hidden; text-overflow: ellipsis; }
+td.detail { word-break: break-all; }
+td.src { white-space: nowrap; }
+td.src a { color: var(--mute); text-decoration: none; border-bottom: 1px dotted var(--mute); }
+td.src a:hover { color: var(--fg); }
+tr.k-ok td, tr.k-note td, tr.k-read td { color: var(--mute); }
+tr.k-err td.detail, tr.k-err td.kind { color: var(--err); }
+tr.k-exec td.kind { color: var(--exec); } tr.k-http td.kind, tr.k-ws td.kind { color: var(--http); }
+tr.k-read td.kind { color: var(--read); } tr.k-write td.kind { color: var(--write); }
+tr.k-api td.kind { color: var(--api); } tr.k-listen td.kind { color: var(--listen); }
+tr.k-ok td.kind { color: var(--ok); } tr.k-note td.kind { color: var(--note); }
+tr.flash td { background: var(--hl); transition: background 1.5s; }
+tr.answered td.detail::after { content: ""; }
+aside { width: min(48ch, 45vw); border-left: 1px solid var(--line); background: var(--panel);
+  display: none; flex-direction: column; min-height: 0; }
+aside.open { display: flex; }
+aside .head { display: flex; gap: 8px; align-items: center; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); }
+aside .head .file { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+aside .head a { color: var(--fg); }
+aside pre { margin: 0; padding: 8px 0; overflow: auto; flex: 1; font-size: 12px; }
+aside pre .ln { display: inline-block; width: 5ch; text-align: right; color: var(--mute);
+  margin-right: 12px; user-select: none; }
+aside pre .cur { background: var(--hl); display: block; }
+aside pre .row { display: block; padding: 0 12px; white-space: pre; }
+footer { padding: 4px 16px; border-top: 1px solid var(--line); color: var(--mute);
+  display: flex; gap: 16px; flex-wrap: wrap; }
+@media (max-width: 720px) {
+  td.src, td.seq { display: none; } aside { width: 100%; position: fixed; inset: 0; }
+  td.target { max-width: 22ch; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>screecap</h1>
+  <span id="state" class="chip">connecting…</span>
+  <span id="output" class="chip" title="output file"></span>
+  <span id="league" class="chip">league</span>
+  <span id="phase" class="chip">phase –</span>
+  <span class="spacer"></span>
+  <button id="rec" class="primary" disabled>Record</button>
+  <button id="term" title="Open a terminal that shows this same ledger live">Open terminal</button>
+  <button id="show" title="Raise the settings window">Settings window</button>
+</header>
+
+<details class="manifest" id="manifest" open>
+  <summary>What this program touches. Every action below is announced here before it runs.</summary>
+  <div class="cols" id="manifest-cols"></div>
+  <div class="paths" id="manifest-paths"></div>
+</details>
+
+<div class="toolbar">
+  <input type="text" id="filter" placeholder="filter (substring of any column)">
+  <span id="kinds"></span>
+  <label><input type="checkbox" id="follow" checked> follow</label>
+  <span class="spacer"></span>
+  <span id="count"></span>
+</div>
+
+<main>
+  <div id="log"><table><tbody id="rows"></tbody></table></div>
+  <aside id="src">
+    <div class="head">
+      <span class="file" id="src-file"></span>
+      <a id="src-gh" href="#" target="_blank" rel="noopener">GitHub ↗</a>
+      <button id="src-close">×</button>
+    </div>
+    <pre id="src-code"></pre>
+  </aside>
+</main>
+
+<footer>
+  <span id="pid"></span>
+  <span id="ledger-path"></span>
+  <span id="conn"></span>
+</footer>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const KINDS = ["exec","http","ws","listen","read","write","api","note","ok","err"];
+  const rows = $("rows"), logEl = $("log");
+  const MAX_ROWS = 5000;
+  let lastSeq = 0, total = 0;
+  const hidden = new Set();
+  let filter = "";
+
+  // ---- status ------------------------------------------------------------
+  async function api(path, opts) {
+    const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opts || {}));
+    if (!r.ok) throw new Error(path + " -> " + r.status);
+    return r.json();
+  }
+  function setChip(el, text, cls) { el.textContent = text; el.className = "chip " + (cls || ""); }
+  async function pollStatus() {
+    try {
+      const s = await api("/api/status");
+      if (s.recording) {
+        setChip($("state"), `recording ${s.frames} frames · ${Math.round(s.elapsed)}s · ${(s.avg_fps||0).toFixed(1)} fps`, "rec");
+        $("rec").textContent = "Stop"; $("rec").disabled = false;
+      } else {
+        setChip($("state"), "idle", "on");
+        $("rec").textContent = "Record"; $("rec").disabled = false;
+      }
+      setChip($("output"), s.output || "", s.output ? "" : "");
+      $("output").style.display = s.output ? "" : "none";
+      setChip($("league"), s.league ? (s.lcu_connected ? "league: client connected" : "league: waiting for client") : "league: off", s.league && s.lcu_connected ? "on" : "");
+      setChip($("phase"), "phase " + (s.phase || "–"), s.phase ? "on" : "");
+      $("pid").textContent = `pid ${s.pid} · port ${s.port} · v${s.version} · up ${Math.round(s.now - s.started)}s`;
+    } catch (e) {
+      setChip($("state"), "screecap not reachable", "");
+      $("rec").disabled = true;
+    }
+  }
+  async function action(name) {
+    try { await api("/api/action/" + name, { method: "POST" }); }
+    catch (e) { console.error(e); }
+    pollStatus();
+  }
+  $("rec").onclick = () => action($("rec").textContent === "Stop" ? "record-stop" : "record-start");
+  $("term").onclick = () => action("terminal");
+  $("show").onclick = () => action("show");
+
+  // ---- manifest ----------------------------------------------------------
+  async function loadManifest() {
+    try {
+      const m = await api("/api/manifest");
+      const cols = $("manifest-cols"); cols.innerHTML = "";
+      for (const key of ["reads","writes","connects","never"]) {
+        const d = document.createElement("div");
+        const h = document.createElement("h3"); h.textContent = key; d.appendChild(h);
+        const ul = document.createElement("ul");
+        for (const item of m.manifest[key]) { const li = document.createElement("li"); li.textContent = item; ul.appendChild(li); }
+        d.appendChild(ul); cols.appendChild(d);
+      }
+      $("manifest-paths").textContent = `ledger: ${m.ledger_path} · data: ${m.data_dir} · source: ${m.repo} @ ${m.commit.slice(0,10)}`;
+      $("ledger-path").textContent = m.ledger_path;
+      try { if (localStorage.getItem("manifest-closed") === "1") $("manifest").open = false; } catch (e) {}
+    } catch (e) { console.error(e); }
+  }
+  $("manifest").addEventListener("toggle", () => { try { localStorage.setItem("manifest-closed", $("manifest").open ? "0" : "1"); } catch (e) {} });
+
+  // ---- ledger rows -------------------------------------------------------
+  function localTime(ts) {
+    const d = new Date(ts); if (isNaN(d)) return ts.slice(11, 23);
+    const p = (n, w) => String(n).padStart(w, "0");
+    return `${p(d.getHours(),2)}:${p(d.getMinutes(),2)}:${p(d.getSeconds(),2)}.${p(d.getMilliseconds(),3)}`;
+  }
+  function matches(tr) {
+    if (hidden.has(tr.dataset.kind)) return false;
+    if (!filter) return true;
+    return tr.textContent.toLowerCase().includes(filter);
+  }
+  function addRow(rec, flash) {
+    const tr = document.createElement("tr");
+    tr.className = "k-" + rec.kind + (flash ? " flash" : "");
+    tr.dataset.kind = rec.kind; tr.dataset.seq = rec.seq;
+    const cell = (cls, text) => { const td = document.createElement("td"); td.className = cls; td.textContent = text; tr.appendChild(td); return td; };
+    cell("ts", localTime(rec.ts));
+    cell("seq", rec.seq);
+    cell("kind", rec.kind);
+    const tg = cell("target", (rec.kind === "ok" || rec.kind === "err" ? "↳ " : "") + rec.target);
+    tg.title = rec.target;
+    const dt = cell("detail", rec.detail);
+    dt.title = rec.detail;
+    const src = document.createElement("td"); src.className = "src";
+    if (rec.src && rec.src !== "?") {
+      const a = document.createElement("a"); a.href = "#"; a.textContent = rec.src;
+      a.title = "show the code that did this";
+      a.onclick = (ev) => { ev.preventDefault(); showSource(rec.src); };
+      src.appendChild(a);
+    }
+    tr.appendChild(src);
+    tr.style.display = matches(tr) ? "" : "none";
+    rows.appendChild(tr);
+    if (flash) setTimeout(() => tr.classList.remove("flash"), 50);
+    total++;
+    while (rows.children.length > MAX_ROWS) rows.removeChild(rows.firstChild);
+    if (rec.seq > lastSeq) lastSeq = rec.seq;
+    if ($("follow").checked) logEl.scrollTop = logEl.scrollHeight;
+    $("count").textContent = `${rows.children.length} lines · seq ${lastSeq}`;
+  }
+  function refilter() {
+    for (const tr of rows.children) tr.style.display = matches(tr) ? "" : "none";
+  }
+  $("filter").addEventListener("input", (e) => { filter = e.target.value.trim().toLowerCase(); refilter(); });
+  const kindsEl = $("kinds");
+  for (const k of KINDS) {
+    const l = document.createElement("label");
+    const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = true;
+    cb.onchange = () => { if (cb.checked) hidden.delete(k); else hidden.add(k); refilter(); };
+    l.appendChild(cb); l.appendChild(document.createTextNode(k)); kindsEl.appendChild(l);
+  }
+  logEl.addEventListener("scroll", () => {
+    const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 8;
+    if (!atBottom && $("follow").checked) $("follow").checked = false;
+    if (atBottom && !$("follow").checked) $("follow").checked = true;
+  });
+
+  // ---- live stream ---------------------------------------------------------
+  let es = null, first = true;
+  function connect() {
+    es = new EventSource("/api/ledger/stream?since=" + lastSeq, { withCredentials: true });
+    es.onopen = () => { $("conn").textContent = "live"; };
+    es.onmessage = (ev) => {
+      try { const rec = JSON.parse(ev.data); addRow(rec, !first); } catch (e) {}
+    };
+    es.onerror = () => { $("conn").textContent = "reconnecting…"; first = true; };
+    setTimeout(() => { first = false; }, 1500);
+  }
+
+  // ---- source drawer -------------------------------------------------------
+  async function showSource(src) {
+    try {
+      const s = await api("/api/source?src=" + encodeURIComponent(src));
+      $("src-file").textContent = `${s.file}:${s.line}`;
+      $("src-gh").href = s.github;
+      const pre = $("src-code"); pre.innerHTML = "";
+      s.lines.forEach((text, i) => {
+        const n = s.start + i;
+        const row = document.createElement("span"); row.className = "row" + (n === s.line ? " cur" : "");
+        const ln = document.createElement("span"); ln.className = "ln"; ln.textContent = n;
+        row.appendChild(ln); row.appendChild(document.createTextNode(text)); pre.appendChild(row);
+      });
+      $("src").classList.add("open");
+      const cur = pre.querySelector(".cur"); if (cur) cur.scrollIntoView({ block: "center" });
+    } catch (e) { console.error(e); }
+  }
+  $("src-close").onclick = () => $("src").classList.remove("open");
+
+  loadManifest(); pollStatus(); setInterval(pollStatus, 1000); connect();
+})();
+</script>
+</body>
+</html>

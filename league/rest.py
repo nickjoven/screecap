@@ -1,6 +1,8 @@
 """Synchronous REST client for the LCU."""
 import json
 import urllib.request
+
+import ledger
 from typing import Any
 
 from ._ssl import INSECURE_LOCALHOST_CTX
@@ -28,11 +30,19 @@ class Client:
         if data is not None:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout, context=INSECURE_LOCALHOST_CTX) as resp:
-            raw = resp.read()
-            if not raw:
-                return None
-            return json.loads(raw.decode("utf-8"))
+        # The URL carries the port, never the token (that is in the header).
+        entry = ledger.begin("http", f"{method} {url}",
+                             data.decode("utf-8", "replace") if data else "")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=INSECURE_LOCALHOST_CTX) as resp:
+                raw = resp.read()
+                entry.ok(f"{resp.status} {len(raw)} B")
+        except Exception as e:
+            entry.err(f"{type(e).__name__}: {e}")
+            raise
+        if not raw:
+            return None
+        return json.loads(raw.decode("utf-8"))
 
     def get(self, path: str) -> Any:
         return self.request("GET", path)

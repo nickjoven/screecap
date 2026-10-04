@@ -13,6 +13,7 @@ CLI usage (idempotent):
     python -m windows_integration --refresh-jumplist   # rebuild taskbar tasks
 """
 import argparse
+import ledger
 import logging
 import os
 import sys
@@ -110,13 +111,15 @@ def set_launch_on_login(enabled: bool) -> bool:
             cmd = _launch_command("--minimized")
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0,
                                 winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+                with ledger.begin("write", f"HKCU\\{RUN_KEY_PATH}\\{RUN_VALUE_NAME}", cmd):
+                    winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
             log.info("launch-on-login enabled: %s", cmd)
         else:
             try:
                 with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0,
                                     winreg.KEY_SET_VALUE) as key:
-                    winreg.DeleteValue(key, RUN_VALUE_NAME)
+                    with ledger.begin("write", f"HKCU\\{RUN_KEY_PATH}\\{RUN_VALUE_NAME}", "delete"):
+                        winreg.DeleteValue(key, RUN_VALUE_NAME)
                 log.info("launch-on-login disabled")
             except FileNotFoundError:
                 pass  # already absent — treat as success
@@ -215,6 +218,8 @@ DEFAULT_JUMP_TASKS = [
     ("Toggle League auto-record", "toggle-auto-record",
      "Enable or disable starting recordings on match start"),
     ("Open data folder",        "open-data-dir", "Open %LOCALAPPDATA%\\screecap"),
+    ("Open web view",           "open-web",      "The ledger and controls in your browser"),
+    ("Open terminal view",      "open-terminal", "Watch every action live in a terminal"),
 ]
 
 

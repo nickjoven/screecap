@@ -17,6 +17,8 @@ try:
 except ImportError:
     websocket = None
 
+import ledger
+
 from .lockfile import Lockfile
 
 log = logging.getLogger(__name__)
@@ -150,5 +152,8 @@ class EventStream:
             on_close=on_close,
         )
         # run_forever blocks until the connection drops or close() is called.
-        self._ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+        with ledger.begin("ws", url, "subscribe OnJsonApiEvent (every client event, "
+                          "filtered locally; token sent in the header, not shown)") as entry:
+            self._ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+            entry.ok("closed")
         self._ws = None

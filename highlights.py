@@ -28,6 +28,8 @@ import os
 import re
 import shutil
 import subprocess
+
+import ledger
 import tempfile
 import threading
 import time
@@ -110,7 +112,8 @@ class Sidecar:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=1)
-            os.replace(tmp, self.path)
+            with ledger.begin("write", self.path, f"{len(self.markers)} highlight marker(s)"):
+                os.replace(tmp, self.path)
         except Exception:
             try:
                 os.unlink(tmp)
@@ -407,7 +410,7 @@ def probe_duration(video: str) -> Optional[float]:
     if not ffprobe:
         return None
     try:
-        r = subprocess.run(
+        r = ledger.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "csv=p=0", video],
             capture_output=True, text=True, timeout=30,
@@ -478,7 +481,7 @@ def cut_highlights(
                "-ss", f"{w.start:.3f}", "-i", video, "-t", f"{w.duration:.3f}",
                *enc_args, "-movflags", "+faststart", path]
         log.info("cut %d/%d: %s", i, len(windows), subprocess.list2cmdline(cmd))
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = ledger.run(cmd, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(path):
             raise RuntimeError(f"ffmpeg failed on clip {i}: {r.stderr.strip()[-400:]}")
         clips.append(path)
@@ -495,7 +498,7 @@ def cut_highlights(
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                "-f", "concat", "-safe", "0", "-i", list_path,
                "-c", "copy", "-movflags", "+faststart", reel_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, cwd=out_dir)
+        r = ledger.run(cmd, capture_output=True, text=True, cwd=out_dir)
         try:
             os.unlink(list_path)
         except OSError:

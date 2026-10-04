@@ -16,6 +16,29 @@ python record.py --audio "Microphone (USB)" --audio "Stereo Mix"  # mix two sour
 
 There is no test suite or build step.
 
+## Transparency: the ledger is the product surface
+
+`ledger.py` is an append-only file (`%LOCALAPPDATA%\screecap\ledger.log`) with a fixed six-column grammar: `ts | seq | kind | target | detail | src`. Rules that must hold everywhere:
+
+- **Announce before acting.** `ledger.begin(kind, target, detail)` is called *before* the subprocess/HTTP call/write, and answered with `.ok()`/`.err()` (or used as a context manager). `ledger.run(cmd, **kw)` wraps `subprocess.run`; use it instead of `subprocess.run` in every module. The recorder's ffmpeg `Popen` is announced in `start()` and answered in `shutdown()`.
+- **Verbatim, never paraphrased.** The detail column is the real argv (`list2cmdline`), the real request body, the real row written. Do not add a "friendly" description layer; that is where lies would hide.
+- **Secrets are omitted, and the omission is stated.** The League lockfile read logs the port and says "token never written here". Never pass the auth token, cookies or the screecap API token into a ledger call. `server.py` writes `<token>` in the lockfile line for this reason.
+- **Kinds are closed**: `exec http ws listen read write api note ok err`. `ok`/`err` lines have target `#<seq>` of the line they answer. Adding a kind means updating `KINDS`, `cli.py` colours and `web/index.html` filters together.
+- **Network targets are checked against the manifest.** `begin()` emits an `err` "OUTSIDE MANIFEST" for any `http/ws/listen` host that is not local. `MANIFEST` (reads/writes/connects/never) is shown by the CLI header and the browser view; keep it true when adding a capability.
+- **Noise discipline.** Reads of our own DB and inbound websocket events are not actions and are not logged; writes, launches and calls are. `discover_lockfile` only logs when it actually read something, because the EventStream retries it every 2 s while League is closed.
+
+Readers: `cli.py watch` (SSE from the API, falling back to tailing the file), `web/index.html` (EventSource + `/api/source` to show the code behind a line), and the file itself. `seq` continues from the last line in the file across restarts so numbers stay unique; rotation at 50 MB renames, never truncates.
+
+### Local API (server.py) and its trust boundary
+
+The GUI process hosts a stdlib `ThreadingHTTPServer` on `127.0.0.1:<ephemeral>` and writes `%LOCALAPPDATA%\screecap\lockfile` as `screecap:<pid>:<port>:<token>:http` (Riot's lockfile format on purpose; `league/lockfile.py` already parses that shape). Checks, in order: Host must be `127.0.0.1:<port>`/`localhost:<port>` (DNS rebinding); Origin, if present, must be our own origin; then token via `Authorization: Bearer` (CLI) or the `screecap` cookie (browser). `GET /?t=<token>` is the only unauthenticated path: it sets the HttpOnly SameSite=Strict cookie and redirects to `/` so the token leaves the address bar. Actions are `POST /api/action/<name>` with no body; the GUI marshals them onto the Qt thread through `ApiBridge` signals (server threads must never touch widgets). `/api/source` serves only files in `server.source_whitelist()`. Every action request is itself a ledger `api` line.
+
+`cli.py` is the launcher and reader: `running()` = lockfile + live `/api/status`; `ensure_running()` spawns `pythonw gui.py --minimized` and waits for the lockfile, and detects the "older instance without API swallowed the single-instance handoff" case by the child exiting early. `launch_terminal_watch()` (used by the browser/tray "Open terminal") prefers `wt.exe new-tab`.
+
+### Tests
+
+`tests/` holds offscreen suites that run under the Windows venv with `QT_QPA_PLATFORM=offscreen` and a temp `LOCALAPPDATA` (set inside each script; env vars do not cross from WSL into the .exe). From WSL: `.venv/Scripts/python.exe "$(wslpath -w tests/test_ledger.py)"`. They construct the real `MainWindow`, so they also catch wiring breaks.
+
 ## Windows-only
 
 `dxcam` is a Windows-only package (DXGI Desktop Duplication via COM). It will not even install on Linux/macOS. The source can live anywhere — including a WSL path — but the Python interpreter that runs it must be Windows Python. WSL paths are reachable from Windows via `\\wsl$\<distro>\...`.
@@ -25,8 +48,12 @@ There is no test suite or build step.
 Engine + front-ends + integration layer:
 
 ```
+ledger.py               append-only action ledger + capability manifest  (UI-agnostic)
 preflight.py            checks + encoder selection + device enumeration   (UI-agnostic)
 recorder.py             Recorder engine: dxcam capture -> ffmpeg pipe     (UI-agnostic)
+server.py               localhost API + browser view host (stdlib)        (UI-agnostic)
+web/index.html          browser view: status, manifest, live ledger, source drawer
+cli.py                  `screecap` launcher/reader: open, watch, status, ledger, gui, record
 league/                 LCU (REST + WebSocket) and Live Client Data       (UI-agnostic)
 highlights.py           Tagger (markers beside the Recorder) + cut       (UI-agnostic)
 loadouts.py             Per-champion spell/rune memory, spell lock, apply   (UI-agnostic)

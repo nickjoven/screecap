@@ -1,6 +1,29 @@
 # screecap
 
-Simple Windows desktop recorder. DXGI Desktop Duplication for capture, ffmpeg for encoding. Ships with a CLI and a PyQt6 GUI.
+Simple Windows desktop recorder. DXGI Desktop Duplication for capture, ffmpeg for encoding. Ships with a CLI, a PyQt6 GUI, a browser view and a terminal view, all reading one append-only ledger of everything the program does.
+
+## Transparency
+
+screecap announces every action **before** it runs, verbatim, in a ledger file with a fixed six-column grammar:
+
+```
+ts | seq | kind | target | detail | src
+2026-10-03T21:19:32.249Z | 3 | listen | http://127.0.0.1:50178/ | local API + browser view; ... | server.py:403
+2026-10-03T21:19:32.251Z | 9 | exec | ffmpeg | ffmpeg -y -hide_banner -f rawvideo ... out.mp4 | recorder.py:153
+2026-10-03T21:21:04.010Z | 10 | ok | #9 | rc=0, 5520 frames, 92.0s, 60.0 fps avg, 311.2 MB | recorder.py:153
+```
+
+`kind` is one of `exec` (a program it launches, full command line), `http` / `ws` (a call to the League client on localhost), `listen` (its own local port), `read` (credentials or the screen), `write` (a file, database row or registry key), `api` (something you clicked in the browser or typed in the terminal), `note`, and `ok` / `err` answering an earlier line by its `seq`. `src` is the file and line that did it, and the browser view turns it into the code. Nothing is paraphrased; the only thing deliberately left out is secrets (the League auth token is read, and the ledger says so, but never written).
+
+Before the first line, the program states what it touches: the screen and audio devices while recording, the output folder you chose, its own data folder, the League client on 127.0.0.1, and nothing on the internet. Any network target outside localhost is flagged in the ledger as a violation.
+
+Three readers of the same ledger:
+
+- **Terminal**: `screecap watch` streams it live. This is the primary view; the terminal is the screensaver.
+- **Browser**: `screecap open` (or *Open web view* in the tray) opens a page on `127.0.0.1` with status, the manifest, the live ledger, Record/Stop, and a click on any `src` to see the code that ran.
+- **File**: `%LOCALAPPDATA%\screecap\ledger.log`, plain text, `tail`-able with anything.
+
+The browser gets a one-time link containing a token, which becomes an HttpOnly cookie; the CLI uses the same token as a Bearer header, read from `%LOCALAPPDATA%\screecap\lockfile` (deliberately the League client's own format). The API binds 127.0.0.1 only and checks `Host` and `Origin`, so no other site or machine can drive it.
 
 ## Requirements
 
@@ -30,7 +53,22 @@ Runs the preflight: ffmpeg present, monitor index reachable, output path writabl
 
 ## Run
 
-**GUI** (recommended for normal use):
+**One command** (starts the tray app if needed, opens the browser view, then watches in this terminal):
+
+```powershell
+python cli.py
+```
+
+```powershell
+python cli.py watch            # terminal view only
+python cli.py status           # what is running and what it touches
+python cli.py ledger -n 100    # last lines of the ledger file
+python cli.py open             # browser view only
+python cli.py gui              # show the settings window
+python cli.py --duration 10    # unknown flags go to the recorder CLI (record.py)
+```
+
+**GUI** (settings window, tray icon):
 
 ```powershell
 python gui.py
@@ -91,10 +129,18 @@ For everything else, run `python record.py --check`. The output is the troublesh
 ## Project layout
 
 ```
-gui.py          PyQt6 GUI
-record.py       CLI
+cli.py          `screecap` command: open / watch / status / ledger / gui / record
+gui.py          PyQt6 settings window + tray; hosts the local API
+server.py       localhost API + browser view (stdlib http.server, token + cookie)
+web/index.html  the browser view
+ledger.py       append-only action ledger (the transparency surface) + manifest
+record.py       recorder CLI
 recorder.py     capture/encode engine (UI-agnostic)
 preflight.py    setup checks + encoder/device discovery
+league/         League client API (LCU) integration
+loadouts.py     per-champion spell/rune memory + spell lock
+highlights.py   highlight markers and clip cutting
+tests/          offscreen test suites (run with the Windows venv)
 CLAUDE.md       guidance for AI assistants working on this codebase
 ```
 

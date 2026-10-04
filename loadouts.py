@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+import ledger
 import logging_setup
 from league.rest import Client
 
@@ -113,9 +114,10 @@ SCHEMA_VERSION = 2
 def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(loadout)")}
     if "locked" not in cols:
-        conn.execute(
-            "ALTER TABLE loadout ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"
-        )
+        with ledger.begin("write", db_path(), "ALTER TABLE loadout ADD COLUMN locked (schema v1 -> v2)"):
+            conn.execute(
+                "ALTER TABLE loadout ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"
+            )
         log.info("loadouts.db migrated to schema v2 (locked column)")
 
 
@@ -134,7 +136,10 @@ def record_loadout(puuid: str, champion_id: int, spell1_id: int,
         return
     rune_json = json.dumps(rune_page) if rune_page else None
     now = datetime.now(timezone.utc).isoformat()
-    with _connect() as conn:
+    with ledger.begin("write", db_path(),
+                      f"upsert loadout champ={champion_id} spells=({spell_name(spell1_id)}, "
+                      f"{spell_name(spell2_id)}) runes={(rune_page or {}).get('name')!r} "
+                      "(locked rows keep their spells)"), _connect() as conn:
         conn.execute("""
             INSERT INTO loadout (puuid, champion_id, spell1_id, spell2_id,
                                  rune_page_json, last_seen, count)
@@ -190,7 +195,10 @@ def set_locked(puuid: str, champion_id: int, locked: bool,
     if not puuid or champion_id <= 0:
         return None
     now = datetime.now(timezone.utc).isoformat()
-    with _connect() as conn:
+    what = (f"lock champ={champion_id} to ({spell_name(spell1_id)}, {spell_name(spell2_id)})"
+            if locked and spell1_id > 0 and spell2_id > 0 else
+            f"{'lock' if locked else 'unlock'} champ={champion_id} (spells unchanged)")
+    with ledger.begin("write", db_path(), what), _connect() as conn:
         if locked and spell1_id > 0 and spell2_id > 0:
             conn.execute("""
                 INSERT INTO loadout (puuid, champion_id, spell1_id, spell2_id,

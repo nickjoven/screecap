@@ -4,14 +4,18 @@ import logging
 import os
 import subprocess
 import sys
+import webbrowser
 
 from PyQt6 import QtCore, QtGui, QtNetwork, QtWidgets
 
+import cli
 import highlights
 import league
+import ledger
 import loadouts
 import logging_setup
 import preflight
+import server
 import windows_integration
 from recorder import Recorder
 
@@ -42,6 +46,13 @@ class LCUBridge(QtCore.QObject):
     phase_changed = QtCore.pyqtSignal(str)
     connected = QtCore.pyqtSignal()
     disconnected = QtCore.pyqtSignal()
+
+
+class ApiBridge(QtCore.QObject):
+    """Marshals actions requested over the local API (server threads) onto the GUI thread."""
+    start_record = QtCore.pyqtSignal()
+    stop_record = QtCore.pyqtSignal()
+    show = QtCore.pyqtSignal()
 
 
 class LoadoutBridge(QtCore.QObject):
@@ -864,6 +875,8 @@ JUMP_ACTIONS = {
     "open-last",
     "toggle-auto-record",
     "open-data-dir",
+    "open-web",
+    "open-terminal",
 }
 
 
@@ -942,6 +955,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # We only auto-stop a recording we auto-started — manual recordings
         # ignore phase transitions so the user keeps full control.
         self._auto_started = False
+        self._lcu_phase = ""
+        self._lcu_connected = False
+        # Local API + browser view (server.py). Started after the UI exists so
+        # status/actions have something to talk to; stopped on real quit.
+        self._api: "server.Server | None" = None
+        self._api_bridge = ApiBridge()
+        self._api_bridge.start_record.connect(self._api_start_record)
+        self._api_bridge.stop_record.connect(self._stop_recording)
+        self._api_bridge.show.connect(self._show_window)
 
         # Highlights: a Tagger writes markers beside the recording; after it
         # ends a HighlightWorker cuts them. See highlights.py.
@@ -972,6 +994,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_auto_record_pref()
         self._load_highlight_prefs()
         self._load_persistent_prefs()
+        self._start_api()
         self._build_tray()
 
         self.poll_timer = QtCore.QTimer(self)
@@ -1207,6 +1230,16 @@ class MainWindow(QtWidgets.QMainWindow):
         refresh_jl_act = QtGui.QAction("Refresh taskbar &jump list", self)
         refresh_jl_act.triggered.connect(self._refresh_jump_list)
         integration_menu.addAction(refresh_jl_act)
+
+        view_menu = self.menuBar().addMenu("&View")
+        open_web = QtGui.QAction("Open &web view", self)
+        open_web.setToolTip("The ledger and controls in your browser")
+        open_web.triggered.connect(self._open_web_view)
+        view_menu.addAction(open_web)
+        open_term = QtGui.QAction("Open &terminal view", self)
+        open_term.setToolTip("Watch every action live in a terminal")
+        open_term.triggered.connect(self._open_terminal_view)
+        view_menu.addAction(open_term)
 
         help_menu = self.menuBar().addMenu("&Help")
         open_log = QtGui.QAction("Open &log file", self)
@@ -1517,14 +1550,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def _on_lcu_connected(self):
+        self._lcu_connected = True
         self.auto_record_status.setText("connected")
 
     @QtCore.pyqtSlot()
     def _on_lcu_disconnected(self):
+        self._lcu_connected = False
+        self._lcu_phase = ""
         self.auto_record_status.setText("disconnected; retrying...")
 
     @QtCore.pyqtSlot(str)
     def _on_lcu_phase_changed(self, phase: str):
+        if phase != self._lcu_phase:
+            ledger.note("league:phase", phase)
+        self._lcu_phase = phase
         self.auto_record_status.setText(f"phase: {phase}")
         log.info("LCU phase: %s (recording=%s, auto_started=%s)",
                  phase, self.thread is not None, self._auto_started)
@@ -1591,6 +1630,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # in sync regardless of which surface the user toggles from.
         self._action_auto_record.toggled.connect(self.auto_record_check.setChecked)
         self.auto_record_check.toggled.connect(self._action_auto_record.setChecked)
+        menu.addAction("Open web view").triggered.connect(self._open_web_view)
+        menu.addAction("Open terminal view").triggered.connect(self._open_terminal_view)
         menu.addAction("Open data folder").triggered.connect(self._open_log_folder)
         menu.addSeparator()
         menu.addAction("Quit").triggered.connect(self._quit)
@@ -1664,8 +1705,90 @@ class MainWindow(QtWidgets.QMainWindow):
             self.auto_record_check.setChecked(not self.auto_record_check.isChecked())
         elif action == "open-data-dir":
             self._open_log_folder()
+        elif action == "open-web":
+            self._open_web_view()
+        elif action == "open-terminal":
+            self._open_terminal_view()
         else:
             log.warning("unknown jump action: %r", action)
+
+    # ------------------------------------------------------------------
+    # Local API + browser/terminal views
+    # ------------------------------------------------------------------
+
+    def _start_api(self):
+        hooks = server.Hooks(
+            status=self._api_status,
+            actions={
+                "record-start": self._api_action_start,
+                "record-stop": self._api_action_stop,
+                "show": self._api_action_show,
+                "terminal": cli.launch_terminal_watch,
+            },
+        )
+        try:
+            self._api = server.Server(hooks).start()
+        except OSError as e:
+            log.exception("local API failed to start")
+            self.statusBar().showMessage(f"Local API unavailable: {e}", 8000)
+            self._api = None
+
+    def _api_status(self) -> dict:
+        """Called on an API thread: read-only, advisory integers/strings only."""
+        rec = self.recorder
+        recording = self.thread is not None and rec is not None
+        return {
+            "recording": recording,
+            "output": (rec.output if rec is not None else None) or self._last_output_path,
+            "frames": rec.frame_count if recording else 0,
+            "elapsed": rec.elapsed if recording and rec.start_time else 0.0,
+            "avg_fps": rec.avg_fps if recording and rec.start_time else 0.0,
+            "auto_started": self._auto_started,
+            "league": self.lcu_check.isChecked(),
+            "lcu_connected": self._lcu_connected,
+            "phase": self._lcu_phase,
+            "auto_record": self.auto_record_check.isChecked(),
+            "data_dir": logging_setup.log_dir(),
+            "log_path": logging_setup.log_path(),
+            "ledger_path": ledger.path(),
+        }
+
+    def _api_action_start(self):
+        if self.thread is not None:
+            return "already recording"
+        self._api_bridge.start_record.emit()
+        return "queued on the GUI thread"
+
+    def _api_action_stop(self):
+        if self.thread is None:
+            return "not recording"
+        self._api_bridge.stop_record.emit()
+        return "queued on the GUI thread"
+
+    def _api_action_show(self):
+        self._api_bridge.show.emit()
+        return "queued on the GUI thread"
+
+    @QtCore.pyqtSlot()
+    def _api_start_record(self):
+        if self.thread is None:
+            self._start_recording()
+
+    def _open_web_view(self):
+        if self._api is None:
+            self.statusBar().showMessage("Local API is not running.", 5000)
+            return
+        ledger.begin("exec", "browser",
+                     f"{self._api.base_url}/?t=<token>  (one-time link; the token becomes a cookie)").ok()
+        webbrowser.open(self._api.url)
+
+    def _open_terminal_view(self):
+        try:
+            msg = cli.launch_terminal_watch()
+        except OSError as e:
+            msg = f"could not open a terminal: {e}"
+            log.exception("launch_terminal_watch failed")
+        self.statusBar().showMessage(msg, 5000)
 
     def _open_log_folder(self):
         folder = logging_setup.log_dir()
@@ -2243,6 +2366,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hide()
             self._update_tray_state()
             return
+        if self._api is not None:
+            self._api.stop()
+            self._api = None
         if self._lcu_stream is not None:
             self._lcu_stream.stop(timeout=2.0)
             self._lcu_stream = None
