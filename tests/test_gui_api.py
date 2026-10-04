@@ -44,6 +44,48 @@ if al.count() >= 2:
     check(win.audio_hint.isVisibleTo(win) and "recorded twice" in win.audio_hint.text(), "two audio inputs: doubled-source hint shown")
 else:
     print("     (fewer than two audio devices here; hint check skipped)")
+# settings over the API. The request must come from another thread while this
+# (GUI) thread pumps events, because apply runs on the GUI thread via GuiCall.
+import threading, json, urllib.request, urllib.error
+def api_from_thread(path, method="GET", body=None):
+    box = {}
+    def go():
+        req = urllib.request.Request(f"http://127.0.0.1:{info['port']}{path}", method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Authorization": f"Bearer {info['token']}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r: box["status"], box["body"] = r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e: box["status"], box["body"] = e.code, json.loads(e.read() or b"{}")
+        except Exception as e: box["status"], box["body"] = -1, {"error": repr(e)}
+    t = threading.Thread(target=go, daemon=True); t.start()
+    for _ in range(400):
+        app.processEvents(); time.sleep(0.01)
+        if not t.is_alive(): break
+    return box.get("status"), box.get("body")
+st, s0 = api_from_thread("/api/settings")
+check(st == 200 and "fps" in s0 and "available" in s0 and s0["monitor"] == screens.AUTO, "GET /api/settings returns the snapshot")
+newfps = 30 if s0["fps"] != 30 else 24
+st, s1 = api_from_thread("/api/settings", "POST", {"fps": newfps, "postgame_reminder": not s0["postgame_reminder"]})
+check(st == 200 and s1["fps"] == newfps and win.fps_spin.value() == newfps and win.postgame_check.isChecked() == (not s0["postgame_reminder"]),
+      "POST applies fps + a checkbox on the GUI thread")
+check(win._settings.value("capture/fps", 0, type=int) == newfps, "applied fps is persisted to QSettings")
+check(ledger.tail(2)[0]["kind"] == "api" and f'"fps": {newfps}' in ledger.tail(2)[0]["detail"], "settings change announced verbatim in the ledger")
+st, b = api_from_thread("/api/settings", "POST", {"fps": 9999})
+check(st == 400 and "fps" in b["error"], "out-of-range fps -> 400")
+st, b = api_from_thread("/api/settings", "POST", {"nope": 1})
+check(st == 400 and "unknown" in b["error"], "unknown key -> 400")
+st, b = api_from_thread("/api/settings", "POST", {"monitor": "DISPLAY99"})
+check(st == 400, "unknown monitor spec -> 400")
+if s0["available"]["monitors"][1:]:
+    spec = s0["available"]["monitors"][1]["spec"]
+    st, b = api_from_thread("/api/settings", "POST", {"monitor": spec})
+    check(st == 200 and win.monitor_picker.selected_spec() == spec, "monitor spec applied to the picker")
+    api_from_thread("/api/settings", "POST", {"monitor": screens.AUTO})
+win.thread = object()
+st, b = api_from_thread("/api/settings", "POST", {"fps": 60})
+check(st == 409, "settings refused while recording (409)")
+win.thread = None
+api_from_thread("/api/settings", "POST", {"fps": s0["fps"], "postgame_reminder": s0["postgame_reminder"]})
 # jump actions and jump list stay in lockstep
 check({"open-web", "open-terminal"} <= gui.JUMP_ACTIONS, "new jump actions registered")
 check({a for _, a, _ in windows_integration.DEFAULT_JUMP_TASKS} == gui.JUMP_ACTIONS - {"show"}, "jump list tasks == JUMP_ACTIONS minus show")

@@ -49,6 +49,21 @@ details.manifest h3 { margin: 4px 0 2px; font-size: 12px; text-transform: upperc
   letter-spacing: .06em; color: var(--fg); }
 details.manifest ul { margin: 0; padding-left: 18px; }
 details.manifest .paths { margin-top: 6px; }
+details.settings { padding: 8px 16px; border-bottom: 1px solid var(--line); }
+details.settings summary { cursor: pointer; }
+.sgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 6px 24px; margin-top: 8px; }
+.sgrid label.f { display: grid; grid-template-columns: 11ch 1fr; gap: 8px; align-items: center; }
+.sgrid label.f > span { color: var(--mute); }
+.sgrid input[type=text], .sgrid input[type=number], .sgrid select { font: inherit; padding: 3px 6px;
+  border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); width: 100%; }
+.sgrid input[type=number] { width: 9ch; }
+.sgrid .checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.sgrid .checks label { display: inline-flex; gap: 4px; align-items: center; }
+.sgrid .region { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.sactions { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+#settings-status { color: var(--mute); }
+#settings-status.err { color: var(--err); }
+#settings-status.ok { color: var(--ok); }
 .toolbar { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center;
   padding: 6px 16px; border-bottom: 1px solid var(--line); color: var(--mute); }
 .toolbar input[type=text] { font: inherit; padding: 3px 6px; border: 1px solid var(--line);
@@ -111,6 +126,44 @@ footer { padding: 4px 16px; border-top: 1px solid var(--line); color: var(--mute
   <summary>What this program touches. Every action below is announced here before it runs.</summary>
   <div class="cols" id="manifest-cols"></div>
   <div class="paths" id="manifest-paths"></div>
+</details>
+
+<details class="settings" id="settings">
+  <summary>Settings <span id="settings-note" style="color:var(--mute)"></span></summary>
+  <form id="sform" autocomplete="off">
+    <div class="sgrid">
+      <label class="f"><span>output</span><input type="text" name="output"></label>
+      <label class="f"><span>if exists</span><select name="on_exist"></select></label>
+      <label class="f"><span>fps</span><input type="number" name="fps" min="1" max="240"></label>
+      <label class="f"><span>encoder</span><select name="encoder"></select></label>
+      <label class="f"><span>monitor</span><select name="monitor"></select></label>
+      <label class="f"><span>region</span>
+        <span class="region">
+          <label><input type="checkbox" name="region_enabled"> use</label>
+          <input type="number" name="r_left" placeholder="left" title="left">
+          <input type="number" name="r_top" placeholder="top" title="top">
+          <input type="number" name="r_right" placeholder="right" title="right">
+          <input type="number" name="r_bottom" placeholder="bottom" title="bottom">
+        </span></label>
+      <label class="f"><span>audio</span><span class="checks" id="s-audio"></span></label>
+      <label class="f"><span>league</span>
+        <span class="checks">
+          <label><input type="checkbox" name="league"> loadout memory</label>
+          <label><input type="checkbox" name="postgame_reminder"> postgame reminder</label>
+          <label><input type="checkbox" name="auto_record"> auto-record matches</label>
+        </span></label>
+      <label class="f"><span>highlights</span>
+        <span class="checks">
+          <label><input type="checkbox" name="auto_cut"> cut after recording</label>
+          <label><input type="checkbox" name="fast_cut"> fast cut (stream copy)</label>
+        </span></label>
+    </div>
+    <div class="sactions">
+      <button type="submit" class="primary" id="s-save">Save</button>
+      <button type="button" id="s-reload">Reload</button>
+      <span id="settings-status"></span>
+    </div>
+  </form>
 </details>
 
 <div class="toolbar">
@@ -291,6 +344,66 @@ footer { padding: 4px 16px; border-top: 1px solid var(--line); color: var(--mute
     } catch (e) { console.error(e); }
   }
   $("src-close").onclick = () => $("src").classList.remove("open");
+
+  // ---- settings ----------------------------------------------------------
+  const sform = $("sform");
+  function fillSelect(sel, options, value) {
+    sel.innerHTML = "";
+    for (const o of options) {
+      const opt = document.createElement("option");
+      opt.value = typeof o === "string" ? o : o.spec; opt.textContent = typeof o === "string" ? o : o.label;
+      sel.appendChild(opt);
+    }
+    sel.value = value;
+  }
+  function setStatus(text, cls) { const el = $("settings-status"); el.textContent = text; el.className = cls || ""; }
+  async function loadSettings() {
+    try {
+      const s = await api("/api/settings");
+      sform.output.value = s.output;
+      fillSelect(sform.on_exist, s.available.on_exist, s.on_exist);
+      sform.fps.value = s.fps; sform.fps.min = s.available.fps[0]; sform.fps.max = s.available.fps[1];
+      fillSelect(sform.encoder, s.available.encoders, s.encoder);
+      fillSelect(sform.monitor, s.available.monitors, s.monitor);
+      sform.region_enabled.checked = s.region_enabled;
+      for (const k of ["left","top","right","bottom"]) sform["r_" + k].value = s.region[k];
+      const box = $("s-audio"); box.innerHTML = "";
+      for (const name of s.available.audio_devices) {
+        const l = document.createElement("label");
+        const cb = document.createElement("input"); cb.type = "checkbox"; cb.name = "audio"; cb.value = name;
+        cb.checked = s.audio_devices.includes(name);
+        l.appendChild(cb); l.appendChild(document.createTextNode(name)); box.appendChild(l);
+      }
+      if (!s.available.audio_devices.length) box.textContent = "(no audio devices found)";
+      for (const k of ["league","postgame_reminder","auto_record","auto_cut","fast_cut"]) sform[k].checked = s[k];
+      $("s-save").disabled = !!s.recording;
+      $("settings-note").textContent = s.recording ? "(locked while recording)" : "";
+      setStatus("", "");
+    } catch (e) { setStatus("could not load settings: " + e.message, "err"); }
+  }
+  sform.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const body = {
+      output: sform.output.value, on_exist: sform.on_exist.value, fps: parseInt(sform.fps.value, 10),
+      encoder: sform.encoder.value, monitor: sform.monitor.value,
+      region_enabled: sform.region_enabled.checked,
+      region: Object.fromEntries(["left","top","right","bottom"].map(k => [k, parseInt(sform["r_" + k].value || "0", 10)])),
+      audio_devices: Array.from(sform.querySelectorAll('input[name=audio]:checked')).map(i => i.value),
+      league: sform.league.checked, postgame_reminder: sform.postgame_reminder.checked,
+      auto_record: sform.auto_record.checked, auto_cut: sform.auto_cut.checked, fast_cut: sform.fast_cut.checked,
+    };
+    setStatus("saving…", "");
+    try {
+      const r = await fetch("/api/settings", { method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const j = await r.json();
+      if (!r.ok) { setStatus(j.error || ("HTTP " + r.status), "err"); return; }
+      setStatus("saved — see the api line in the ledger", "ok");
+      loadSettings();
+    } catch (e) { setStatus("save failed: " + e.message, "err"); }
+  });
+  $("s-reload").onclick = loadSettings;
+  $("settings").addEventListener("toggle", () => { if ($("settings").open) loadSettings(); });
 
   loadManifest(); pollStatus(); setInterval(pollStatus, 1000); connect();
 })();

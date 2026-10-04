@@ -22,7 +22,7 @@ Before the first line, the program states what it touches: the screen and audio 
 Three readers of the same ledger:
 
 - **Terminal**: `screecap watch` streams it live. This is the primary view; the terminal is the screensaver.
-- **Browser**: `screecap open` (or *Open web view* in the tray) opens a page on `127.0.0.1` with status, the manifest, the live ledger, Record/Stop, and a click on any `src` to see the code that ran.
+- **Browser**: `screecap open` (or *Open web view* in the tray) opens a page on `127.0.0.1` with status, the manifest, the live ledger, Record/Stop, every setting (output, encoder, monitor, audio inputs, League and highlight options; each save is itself a ledger line with the exact change), and a click on any `src` to see the code that ran.
 - **File**: `%LOCALAPPDATA%\screecap\ledger.log`, plain text, `tail`-able with anything.
 
 The browser gets a one-time link containing a token, which becomes an HttpOnly cookie; the CLI uses the same token as a Bearer header, read from `%LOCALAPPDATA%\screecap\lockfile` (deliberately the League client's own format). The API binds 127.0.0.1 only and checks `Host` and `Origin`, so no other site or machine can drive it.

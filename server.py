@@ -104,6 +104,10 @@ class Hooks:
     """What the hosting process lends the API. All callables may run on a server thread."""
     status: Callable[[], Dict]
     actions: Dict[str, Callable[[], Optional[str]]] = field(default_factory=dict)
+    # settings() -> current settings + what is available; apply_settings(changes) -> new
+    # settings. apply raises ValueError (bad value -> 400) or RuntimeError (not now -> 409).
+    settings: Optional[Callable[[], Dict]] = None
+    apply_settings: Optional[Callable[[Dict], Dict]] = None
 
 
 class _Ctx:
@@ -217,6 +221,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return self._stream(since_i)
         if url.path == "/api/source":
             return self._gate() and self._source((qs.get("src") or [""])[0])
+        if url.path == "/api/settings":
+            if not self._gate():
+                return None
+            if self.ctx.hooks.settings is None:
+                return self._json(404, {"error": "settings not available"})
+            try:
+                return self._json(200, self.ctx.hooks.settings())
+            except Exception as e:
+                log.exception("settings hook raised")
+                return self._json(500, {"error": str(e)})
         self._json(404, {"error": "no such path"})
 
     def _get_index(self, qs):
@@ -338,10 +352,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlsplit(self.path)
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)  # bodies are ignored; actions take no arguments
+        body = self.rfile.read(length) if length else b""
         if not self._gate():
             return None
+        if url.path == "/api/settings":
+            return self._post_settings(body)
         if not url.path.startswith("/api/action/"):
             return self._json(404, {"error": "no such path"})
         name = url.path[len("/api/action/"):]
@@ -359,6 +374,35 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return self._json(500, {"error": str(e)})
         entry.ok(result or "")
         return self._json(202, {"ok": True, "action": name, "result": result})
+
+
+    def _post_settings(self, body: bytes):
+        hooks = self.ctx.hooks
+        if hooks.apply_settings is None:
+            return self._json(404, {"error": "settings not available"})
+        try:
+            changes = json.loads(body.decode("utf-8") or "{}")
+        except ValueError:
+            return self._json(400, {"error": "body must be JSON"})
+        if not isinstance(changes, dict) or not changes:
+            return self._json(400, {"error": "body must be a non-empty JSON object"})
+        via = "browser" if self.headers.get("Cookie") else "cli"
+        entry = ledger.begin("api", "POST /api/settings",
+                             f"from {via}: " + json.dumps(changes, ensure_ascii=False, sort_keys=True))
+        try:
+            result = hooks.apply_settings(changes)
+        except ValueError as e:
+            entry.err(f"rejected: {e}")
+            return self._json(400, {"error": str(e)})
+        except RuntimeError as e:
+            entry.err(f"refused: {e}")
+            return self._json(409, {"error": str(e)})
+        except Exception as e:
+            entry.err(f"{type(e).__name__}: {e}")
+            log.exception("apply_settings raised")
+            return self._json(500, {"error": str(e)})
+        entry.ok("applied " + ", ".join(sorted(changes)))
+        return self._json(200, result)
 
 
 class _ThreadingServer(http.server.ThreadingHTTPServer):

@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import webbrowser
 
 from PyQt6 import QtCore, QtGui, QtNetwork, QtWidgets
@@ -47,6 +48,41 @@ class LCUBridge(QtCore.QObject):
     phase_changed = QtCore.pyqtSignal(str)
     connected = QtCore.pyqtSignal()
     disconnected = QtCore.pyqtSignal()
+
+
+class GuiCall(QtCore.QObject):
+    """Run a callable on the GUI thread from any thread and wait for its result.
+
+    Server threads must never touch widgets. Create this on the GUI thread;
+    call() from elsewhere queues the job with a BlockingQueuedConnection and
+    returns (or re-raises) what the job produced. Calling from the GUI thread
+    itself just runs the job inline, so it cannot deadlock on its own thread.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._job: dict = {}
+
+    @QtCore.pyqtSlot()
+    def _run(self):
+        job = self._job
+        try:
+            job["result"] = job["fn"]()
+        except Exception as e:  # noqa: BLE001 — re-raised on the caller's thread
+            job["error"] = e
+
+    def call(self, fn):
+        if QtCore.QThread.currentThread() is self.thread():
+            return fn()
+        with self._lock:
+            self._job = {"fn": fn}
+            QtCore.QMetaObject.invokeMethod(
+                self, "_run", QtCore.Qt.ConnectionType.BlockingQueuedConnection)
+            job, self._job = self._job, {}
+        if "error" in job:
+            raise job["error"]
+        return job["result"]
 
 
 class ApiBridge(QtCore.QObject):
@@ -979,6 +1015,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # status/actions have something to talk to; stopped on real quit.
         self._api: "server.Server | None" = None
         self._api_bridge = ApiBridge()
+        self._gui_call = GuiCall()
         self._api_bridge.start_record.connect(self._api_start_record)
         self._api_bridge.stop_record.connect(self._stop_recording)
         self._api_bridge.show.connect(self._show_window)
@@ -1769,6 +1806,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_api(self):
         hooks = server.Hooks(
             status=self._api_status,
+            settings=lambda: self._gui_call.call(self._settings_snapshot),
+            apply_settings=lambda changes: self._gui_call.call(
+                lambda: self._apply_settings(changes)),
             actions={
                 "record-start": self._api_action_start,
                 "record-stop": self._api_action_stop,
@@ -1803,6 +1843,135 @@ class MainWindow(QtWidgets.QMainWindow):
             "log_path": logging_setup.log_path(),
             "ledger_path": ledger.path(),
         }
+
+    # ---- settings over the API (always on the GUI thread via GuiCall) ----
+
+    SETTINGS_KEYS = ("output", "on_exist", "fps", "encoder", "monitor", "region_enabled",
+                     "region", "audio_devices", "league", "postgame_reminder",
+                     "auto_record", "auto_cut", "fast_cut")
+
+    def _settings_snapshot(self) -> dict:
+        encoders = [self.encoder_combo.itemData(i) for i in range(self.encoder_combo.count())
+                    if self.encoder_combo.itemData(i)]
+        audio_available, audio_checked = [], []
+        for i in range(self.audio_list.count()):
+            item = self.audio_list.item(i)
+            name = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
+            if not (item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            audio_available.append(name)
+            if item.checkState() == QtCore.Qt.CheckState.Checked:
+                audio_checked.append(name)
+        monitors = [{"spec": t.spec, "label": t.label} for t in self.monitor_picker._tiles]
+        return {
+            "output": self.output_edit.text(),
+            "on_exist": self.on_exist_combo.currentData(),
+            "fps": self.fps_spin.value(),
+            "encoder": self.encoder_combo.currentData() or "auto",
+            "monitor": self.monitor_picker.selected_spec(),
+            "region_enabled": self.region_check.isChecked(),
+            "region": {k: v.value() for k, v in self.region_inputs.items()},
+            "audio_devices": audio_checked,
+            "league": self.lcu_check.isChecked(),
+            "postgame_reminder": self.postgame_check.isChecked(),
+            "auto_record": self.auto_record_check.isChecked(),
+            "auto_cut": self.auto_cut_check.isChecked(),
+            "fast_cut": self.hl_fast_check.isChecked(),
+            "recording": self.thread is not None,
+            "available": {
+                "encoders": encoders,
+                "monitors": monitors,
+                "audio_devices": audio_available,
+                "on_exist": [self.on_exist_combo.itemData(i)
+                             for i in range(self.on_exist_combo.count())],
+                "fps": [self.fps_spin.minimum(), self.fps_spin.maximum()],
+            },
+        }
+
+    def _apply_settings(self, changes: dict) -> dict:
+        """Apply a dict of settings to the widgets (their save slots persist them)."""
+        if self.thread is not None:
+            raise RuntimeError("a recording is in progress; stop it first")
+        unknown = sorted(set(changes) - set(self.SETTINGS_KEYS))
+        if unknown:
+            raise ValueError(f"unknown setting(s): {', '.join(unknown)}")
+        snap = self._settings_snapshot()
+        avail = snap["available"]
+
+        def as_bool(key):
+            v = changes[key]
+            if not isinstance(v, bool):
+                raise ValueError(f"{key} must be true/false")
+            return v
+
+        if "output" in changes:
+            if not isinstance(changes["output"], str) or not changes["output"].strip():
+                raise ValueError("output must be a non-empty path")
+        if "on_exist" in changes and changes["on_exist"] not in avail["on_exist"]:
+            raise ValueError(f"on_exist must be one of {avail['on_exist']}")
+        if "fps" in changes:
+            lo, hi = avail["fps"]
+            if not isinstance(changes["fps"], int) or not lo <= changes["fps"] <= hi:
+                raise ValueError(f"fps must be an integer in {lo}..{hi}")
+        if "encoder" in changes and changes["encoder"] not in avail["encoders"]:
+            raise ValueError(f"encoder must be one of {avail['encoders']}")
+        if "monitor" in changes and changes["monitor"] not in [m["spec"] for m in avail["monitors"]]:
+            raise ValueError("monitor must be one of the listed specs")
+        if "region" in changes:
+            r = changes["region"]
+            if not isinstance(r, dict) or set(r) - set(self.region_inputs):
+                raise ValueError("region must be {left, top, right, bottom}")
+            for k, v in r.items():
+                if not isinstance(v, int):
+                    raise ValueError(f"region.{k} must be an integer")
+        if "audio_devices" in changes:
+            devs = changes["audio_devices"]
+            if not isinstance(devs, list) or any(d not in avail["audio_devices"] for d in devs):
+                raise ValueError("audio_devices must be a list of available device names")
+        for key in ("region_enabled", "league", "postgame_reminder", "auto_record",
+                    "auto_cut", "fast_cut"):
+            if key in changes:
+                as_bool(key)
+
+        # All validated; apply. Widget signals run the existing save slots.
+        if "output" in changes:
+            self.output_edit.setText(changes["output"].strip())
+            self._save_output_pref()
+        if "on_exist" in changes:
+            self.on_exist_combo.setCurrentIndex(self.on_exist_combo.findData(changes["on_exist"]))
+        if "fps" in changes:
+            self.fps_spin.setValue(changes["fps"])
+            self._save_fps_pref()
+        if "encoder" in changes:
+            self.encoder_combo.setCurrentIndex(self.encoder_combo.findData(changes["encoder"]))
+            self._save_encoder_pref()
+        if "monitor" in changes:
+            self.monitor_picker.set_selected_spec(changes["monitor"])
+        if "region_enabled" in changes:
+            self.region_check.setChecked(changes["region_enabled"])
+        if "region" in changes:
+            for k, v in changes["region"].items():
+                self.region_inputs[k].setValue(v)
+            self._save_region_pref()
+        if "audio_devices" in changes:
+            want = set(changes["audio_devices"])
+            for i in range(self.audio_list.count()):
+                item = self.audio_list.item(i)
+                name = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
+                if item.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable:
+                    item.setCheckState(QtCore.Qt.CheckState.Checked if name in want
+                                       else QtCore.Qt.CheckState.Unchecked)
+        if "league" in changes:
+            self.lcu_check.setChecked(changes["league"])
+        if "postgame_reminder" in changes:
+            self.postgame_check.setChecked(changes["postgame_reminder"])
+        if "auto_record" in changes:
+            self.auto_record_check.setChecked(changes["auto_record"])
+        if "auto_cut" in changes:
+            self.auto_cut_check.setChecked(changes["auto_cut"])
+        if "fast_cut" in changes:
+            self.hl_fast_check.setChecked(changes["fast_cut"])
+        return self._settings_snapshot()
 
     def _api_action_start(self):
         if self.thread is not None:
