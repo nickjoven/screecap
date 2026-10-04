@@ -345,7 +345,14 @@ def cmd_quit(args) -> int:
     if info is None:
         print("screecap is not running")
         return 0
-    res = _request(info, "/api/action/quit", method="POST")
+    try:
+        res = _request(info, "/api/action/quit", method="POST")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("the running screecap predates `quit` support: Quit it from the tray icon, "
+                  "then run `screecap`")
+            return 1
+        raise
     result = (res or {}).get("result", "")
     print(result or "quit requested")
     if result.startswith("refused"):
