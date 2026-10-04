@@ -315,8 +315,16 @@ def note(target: str, detail: str = "") -> Dict:
     return _L.emit("note", target, detail, src=_caller_src())
 
 
+# Console children of a windowless parent (pythonw) each get a brand-new
+# console window on Windows unless told otherwise. Every program we launch
+# has its output captured, so no window is ever wanted.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
 def run(cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
     """subprocess.run with the full argv announced first and the exit code answered."""
+    if NO_WINDOW and "creationflags" not in kwargs:
+        kwargs["creationflags"] = NO_WINDOW
     target = os.path.basename(str(cmd[0]))
     entry = Entry(_L.emit("exec", target, subprocess.list2cmdline(cmd), src=_caller_src()))
     t0 = time.monotonic()

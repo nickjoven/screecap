@@ -53,6 +53,7 @@ class ApiBridge(QtCore.QObject):
     start_record = QtCore.pyqtSignal()
     stop_record = QtCore.pyqtSignal()
     show = QtCore.pyqtSignal()
+    quit = QtCore.pyqtSignal()
 
 
 class LoadoutBridge(QtCore.QObject):
@@ -964,6 +965,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._api_bridge.start_record.connect(self._api_start_record)
         self._api_bridge.stop_record.connect(self._stop_recording)
         self._api_bridge.show.connect(self._show_window)
+        self._api_bridge.quit.connect(self._quit)
 
         # Highlights: a Tagger writes markers beside the recording; after it
         # ends a HighlightWorker cuts them. See highlights.py.
@@ -1661,6 +1663,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _quit(self):
         self._really_quit = True
+        # close() runs closeEvent's cleanup (API + lockfile, LCU stream, hotkey,
+        # recorder) — QApplication.quit() alone would skip it.
+        self.close()
         QtWidgets.QApplication.quit()
 
     def _update_tray_state(self):
@@ -1723,6 +1728,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "record-start": self._api_action_start,
                 "record-stop": self._api_action_stop,
                 "show": self._api_action_show,
+                "quit": self._api_action_quit,
                 "terminal": cli.launch_terminal_watch,
             },
         )
@@ -1768,6 +1774,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _api_action_show(self):
         self._api_bridge.show.emit()
         return "queued on the GUI thread"
+
+    def _api_action_quit(self):
+        if self.thread is not None:
+            return "refused: a recording is in progress"
+        self._api_bridge.quit.emit()
+        return "quitting"
 
     @QtCore.pyqtSlot()
     def _api_start_record(self):
@@ -2436,6 +2448,8 @@ class _SingleInstanceServer(QtCore.QObject):
         if line == "show":
             self._dispatch("show")
             return
+        if line == "ping":
+            return  # a --minimized launch checking whether we exist
         if line.startswith("jump:"):
             action = line.split(":", 1)[1]
             if action in JUMP_ACTIONS:
@@ -2477,8 +2491,10 @@ def main():
 
     # Single-instance handoff: if another GUI is already running, forward our
     # intent to it and exit without spinning up a duplicate Qt app.
-    handoff = f"jump:{args.jump}" if args.jump else ("show" if not args.minimized else None)
-    if handoff and _try_send_to_running_instance(handoff):
+    # A --minimized launch (run-on-login, or the CLI starting us) must not
+    # become a second instance either: it pings and exits if one answers.
+    handoff = f"jump:{args.jump}" if args.jump else ("ping" if args.minimized else "show")
+    if _try_send_to_running_instance(handoff):
         log.info("handed off to running instance: %s", handoff)
         return
 

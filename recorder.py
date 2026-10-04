@@ -162,7 +162,8 @@ class Recorder:
         self._ledger_ffmpeg = ledger.begin("exec", "ffmpeg", subprocess.list2cmdline(cmd))
         self._ledger_output = ledger.begin("write", self.output, "MP4 output (ffmpeg writes it)")
         self._proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=ledger.NO_WINDOW,  # no console flash under pythonw
         )
         self._stderr_thread = threading.Thread(
             target=self._pump_ffmpeg_stderr,

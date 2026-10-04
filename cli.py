@@ -6,6 +6,8 @@
     screecap status           what is running, what it is doing, what it touches
     screecap ledger [-n N]    last N ledger lines
     screecap gui              show the window (start it if needed)
+    screecap quit             stop the tray app (refused while recording)
+    screecap restart          quit, start again, reopen the browser view
     screecap record [...]     the recorder CLI (record.py); any unknown first
                               argument is passed through, so `screecap --duration 10`
                               still records.
@@ -34,7 +36,7 @@ import logging_setup
 import server
 
 PROJECT_DIR = ledger.PROJECT_DIR
-SUBCOMMANDS = ("open", "watch", "status", "ledger", "gui", "record")
+SUBCOMMANDS = ("open", "watch", "status", "ledger", "gui", "quit", "restart", "record")
 
 # -- colour --------------------------------------------------------------------
 
@@ -338,6 +340,30 @@ def cmd_gui(args) -> int:
     return 0
 
 
+def cmd_quit(args) -> int:
+    info = running()
+    if info is None:
+        print("screecap is not running")
+        return 0
+    res = _request(info, "/api/action/quit", method="POST")
+    result = (res or {}).get("result", "")
+    print(result or "quit requested")
+    if result.startswith("refused"):
+        return 1
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and running() is not None:
+        time.sleep(0.3)
+    return 0 if running() is None else 1
+
+
+def cmd_restart(args) -> int:
+    rc = cmd_quit(args)
+    if rc != 0 and running() is not None:
+        return rc
+    args.then_watch = False
+    return cmd_open(args)
+
+
 def cmd_record(rest) -> int:
     import record
     sys.argv = [os.path.join(PROJECT_DIR, "record.py"), *rest]
@@ -376,6 +402,8 @@ def main(argv=None) -> int:
     lg = sub.add_parser("ledger", help="print the last N ledger lines")
     lg.add_argument("-n", "--lines", type=int, default=50)
     sub.add_parser("gui", help="show the window (start it if needed)")
+    sub.add_parser("quit", help="stop the tray app (refused while recording)")
+    sub.add_parser("restart", help="quit, start again, reopen the browser view")
     sub.add_parser("record", help="record (see record.py --help)")
     args = p.parse_args(argv)
 
@@ -383,7 +411,8 @@ def main(argv=None) -> int:
         args.then_watch = True
         return cmd_open(args)
     return {"open": cmd_open, "watch": cmd_watch, "status": cmd_status,
-            "ledger": cmd_ledger, "gui": cmd_gui}[args.cmd](args)
+            "ledger": cmd_ledger, "gui": cmd_gui, "quit": cmd_quit,
+            "restart": cmd_restart}[args.cmd](args)
 
 
 if __name__ == "__main__":

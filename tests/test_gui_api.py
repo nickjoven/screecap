@@ -54,9 +54,13 @@ routed = {}
 cli.cmd_record = lambda rest: routed.setdefault("rest", rest) or 0
 cli.main(["--duration", "1", "-o", "x.mp4"])
 check(routed.get("rest") == ["--duration", "1", "-o", "x.mp4"], "unknown flags pass through to record")
-# real quit stops the API and removes the lockfile
-win._really_quit = True
-win.close()
-app.processEvents()
-check(win._api is None and server.read_lockfile() is None, "quit stops API and removes lockfile")
+# quit over the API: refused while "recording", otherwise quits via the bridge
+win.thread = object()
+r = cli._request(info, "/api/action/quit", method="POST")
+check(r["result"].startswith("refused"), "quit refused while a recording is in progress")
+win.thread = None
+cli._request(info, "/api/action/quit", method="POST")
+for _ in range(20):
+    app.processEvents(); time.sleep(0.05)
+check(win._api is None and server.read_lockfile() is None, "POST quit stops API and removes lockfile")
 print("\n%d failures" % len(fails)); sys.exit(1 if fails else 0)

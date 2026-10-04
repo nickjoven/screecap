@@ -59,6 +59,16 @@ for _ in range(3):
 seqs = [r["seq"] for r in ledger.tail(6)]
 check(seqs == sorted(seqs) and len(set(seqs)) == 6 and [r["target"] for r in ledger.tail(6)] == ["parent","child"]*3,
       f"interleaved parent/child writes keep seq strictly increasing: {seqs}")
+# ledger.run hides console windows (the pythonw console-flash bug)
+seen = {}
+_real_run = subprocess.run
+def _spy(cmd, **kw): seen.update(kw); return _real_run(cmd, **kw)
+ledger.subprocess.run = _spy
+try:
+    ledger.run([sys.executable, "-c", "pass"], capture_output=True)
+finally:
+    ledger.subprocess.run = _real_run
+check(os.name != "nt" or seen.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW, "ledger.run passes CREATE_NO_WINDOW on Windows")
 # ledger.run
 p = ledger.run([sys.executable, "-c", "print('hi')"], capture_output=True, text=True)
 recs = ledger.tail(2)
