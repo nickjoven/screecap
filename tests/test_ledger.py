@@ -50,6 +50,15 @@ out = subprocess.run([sys.executable, "-c",
     "import os,sys; sys.path.insert(0, os.environ['SCREECAP_DIR']); import ledger; print(ledger.note('t','x')['seq'])"],
     capture_output=True, text=True, env=dict(os.environ, SCREECAP_DIR=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 check(out.stdout.strip() == str(seq_now + 1), f"seq continues from file in a new process ({out.stdout.strip()} vs {seq_now+1})")
+# two processes interleaving writes keep seq strictly increasing in the file
+child_code = "import os,sys; sys.path.insert(0, os.environ['SCREECAP_DIR']); import ledger; ledger.note('child','x')['seq']"
+for _ in range(3):
+    ledger.note("parent", "x")
+    subprocess.run([sys.executable, "-c", child_code], check=True,
+                   env=dict(os.environ, SCREECAP_DIR=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+seqs = [r["seq"] for r in ledger.tail(6)]
+check(seqs == sorted(seqs) and len(set(seqs)) == 6 and [r["target"] for r in ledger.tail(6)] == ["parent","child"]*3,
+      f"interleaved parent/child writes keep seq strictly increasing: {seqs}")
 # ledger.run
 p = ledger.run([sys.executable, "-c", "print('hi')"], capture_output=True, text=True)
 recs = ledger.tail(2)

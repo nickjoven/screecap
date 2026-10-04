@@ -25,6 +25,13 @@ passed in (see league/lockfile.py — the port is logged, the token is not).
 The file is never edited or truncated. When it passes ROTATE_BYTES it is
 renamed to ledger.log.1 (shifting older ones up to .3) and a fresh file
 starts; `seq` continues from the last line so numbers stay unique.
+
+Several processes write the same file (the GUI, and each `cli.py` run). The
+file is the authority for `seq`: before every append the writer checks the
+file size it last saw; if someone else appended, it re-reads the last line
+and continues from there. Two writers landing within the same millisecond
+could still tie; that is accepted — the alternative is a lock file, which
+is more machinery than a ledger should need.
 """
 from __future__ import annotations
 
@@ -157,19 +164,26 @@ class _Ledger:
         self._lock = threading.Lock()
         self._seq = 0
         self._loaded = False
+        self._size_seen = -1   # file size after our last append; -1 = unknown
         self._ring: Deque[Dict] = collections.deque(maxlen=RING_SIZE)
         self._subs: List[Callable[[Dict], None]] = []
 
     # -- persistence -----------------------------------------------------
 
     def _load_seq_locked(self):
-        if self._loaded:
+        """Sync `seq` with the file whenever another process may have appended."""
+        try:
+            size = os.path.getsize(path())
+        except OSError:
+            size = 0
+        if self._loaded and size == self._size_seen:
             return
         self._loaded = True
+        self._size_seen = size
+        if size == 0:
+            return
         try:
             with open(path(), "rb") as f:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
                 f.seek(max(0, size - 4096))
                 tail = f.read().decode("utf-8", "replace")
         except OSError:
@@ -177,7 +191,7 @@ class _Ledger:
         for line in reversed(tail.splitlines()):
             rec = parse_line(line)
             if rec:
-                self._seq = rec["seq"]
+                self._seq = max(self._seq, rec["seq"])
                 return
 
     def _rotate_locked(self, p: str):
@@ -199,6 +213,8 @@ class _Ledger:
             self._rotate_locked(p)
             with open(p, "a", encoding="utf-8") as f:
                 f.write(format_line(rec) + "\n")
+                f.flush()
+                self._size_seen = f.tell()
         except OSError as e:
             # The ledger must never take the app down; say so in the log.
             log.warning("ledger append failed: %s", e)
