@@ -9,7 +9,7 @@ def check(cond, msg):
     if not cond: fails.append(msg)
 
 from PyQt6 import QtCore, QtWidgets
-import gui, cli, ledger, server, windows_integration
+import gui, cli, ledger, server, windows_integration, screens
 QtCore.QCoreApplication.setOrganizationName("screecap-test")
 QtCore.QCoreApplication.setApplicationName("screecap-test")
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -21,6 +21,19 @@ info = cli.running()
 check(info is not None and info["pid"] == os.getpid(), "cli.running() finds the GUI through the lockfile")
 st = info["status"]
 check(st["recording"] is False and "league" in st and st["ledger_path"] == ledger.path(), "status hook reports recorder + league state")
+# monitor picker: Auto first and default; device tiles carry stable specs; legacy int migrates to auto
+mp = win.monitor_picker
+check(mp._tiles and mp._tiles[0].spec == screens.AUTO and mp.selected_spec() == screens.AUTO, "picker defaults to auto (first tile)")
+devs = [t.spec for t in mp._tiles[1:]]
+check(all(d.startswith("\\\\.\\DISPLAY") for d in devs) and len(devs) == len(screens.enumerate_outputs()), f"device tiles use device names: {devs}")
+if devs:
+    check(mp.set_selected_spec(devs[-1]) and mp.selected_spec() == devs[-1] and mp.selected_index() == screens.resolve(devs[-1])[0].idx, "selecting a device tile resolves to its current index")
+    mp.set_selected_spec(screens.AUTO)
+win._settings.setValue("capture/monitor_spec", ""); win._settings.setValue("capture/monitor", 1)
+win._load_persistent_prefs()
+check(mp.selected_spec() == screens.AUTO and ledger.tail(1)[0]["target"] == "settings:capture/monitor", "legacy capture/monitor=1 migrates to auto with a ledger note")
+args = win._collect_args()
+check(isinstance(args["monitor"], int) and args["monitor"] >= 0 and ledger.tail(1)[0]["target"] == "screen:choice", "collect_args resolves the spec and announces the choice")
 # jump actions and jump list stay in lockstep
 check({"open-web", "open-terminal"} <= gui.JUMP_ACTIONS, "new jump actions registered")
 check({a for _, a, _ in windows_integration.DEFAULT_JUMP_TASKS} == gui.JUMP_ACTIONS - {"show"}, "jump list tasks == JUMP_ACTIONS minus show")

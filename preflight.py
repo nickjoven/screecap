@@ -163,20 +163,12 @@ def encoder_args(encoder: str) -> list:
 
 
 def list_monitors() -> list:
-    """Return a list of (index, label) for every DXGI output."""
-    try:
-        info = dxcam.output_info()
-    except Exception:
-        return []
-    monitors = []
-    idx = 0
-    for line in info.splitlines():
-        line = line.strip()
-        if not line or "Output[" not in line:
-            continue
-        monitors.append((idx, line))
-        idx += 1
-    return monitors
+    """Return a list of (index, label) for every DXGI output, labelled by identity.
+
+    Indices are only valid for this enumeration; see screens.py for why.
+    """
+    import screens
+    return [(o.idx, o.describe()) for o in screens.enumerate_outputs()]
 
 
 def list_audio_devices() -> list:

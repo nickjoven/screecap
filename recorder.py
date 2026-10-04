@@ -8,6 +8,7 @@ import time
 from typing import List, Optional, Tuple
 
 import ledger
+import screens
 import dxcam
 
 from preflight import encoder_args
@@ -93,8 +94,9 @@ class Recorder:
             self.duration, self.audio_devices,
         )
         cam_entry = ledger.begin(
-            "read", f"screen:monitor{self.monitor}",
-            f"DXGI Desktop Duplication, {self.fps} fps, region={self.region or 'full'}")
+            "read", f"screen:{screens.describe_index(self.monitor)}",
+            f"dxcam output {self.monitor}, DXGI Desktop Duplication, {self.fps} fps, "
+            f"region={self.region or 'full'}")
         cam = dxcam.create(output_idx=self.monitor, output_color="BGR")
         if cam is None:
             cam_entry.err("no DXGI output at that monitor index")

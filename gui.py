@@ -15,6 +15,7 @@ import ledger
 import loadouts
 import logging_setup
 import preflight
+import screens
 import server
 import windows_integration
 from recorder import Recorder
@@ -256,15 +257,16 @@ class MonitorTile(QtWidgets.QToolButton):
 
     THUMB = QtCore.QSize(192, 108)  # 16:9; tiles fit ~3 monitors at min window width
 
-    def __init__(self, idx: int, label: str, parent=None):
+    def __init__(self, idx: int, label: str, spec: str = "", text: str = "", parent=None):
         super().__init__(parent)
-        self.idx = idx
+        self.idx = idx          # dxcam index at enumeration time (-1 for auto)
         self.label = label
+        self.spec = spec or str(idx)   # what gets saved: "auto" or a device name
         self.setCheckable(True)
         self.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
         self.setIconSize(self.THUMB)
         self.setIcon(QtGui.QIcon(self._make_placeholder()))
-        self.setText(f"{idx}: {label}")
+        self.setText(text or f"{idx}: {label}")
         self.setToolTip(label)
         self.setStyleSheet(
             "QToolButton { padding: 6px; border: 1px solid palette(mid);"
@@ -278,11 +280,14 @@ class MonitorTile(QtWidgets.QToolButton):
             self.setIcon(QtGui.QIcon(pixmap))
 
     def _make_placeholder(self) -> QtGui.QPixmap:
+        return self._make_placeholder_text("loading...")
+
+    def _make_placeholder_text(self, text: str) -> QtGui.QPixmap:
         pix = QtGui.QPixmap(self.THUMB)
         pix.fill(QtGui.QColor(35, 35, 35))
         p = QtGui.QPainter(pix)
         p.setPen(QtGui.QColor(170, 170, 170))
-        p.drawText(pix.rect(), int(QtCore.Qt.AlignmentFlag.AlignCenter), "loading...")
+        p.drawText(pix.rect(), int(QtCore.Qt.AlignmentFlag.AlignCenter), text)
         p.end()
         return pix
 
@@ -293,12 +298,12 @@ class MonitorPicker(QtWidgets.QWidget):
     Shows one MonitorTile per dxcam output with a live thumbnail, plus a
     Refresh button to re-detect after plugging/unplugging displays.
     """
-    selection_changed = QtCore.pyqtSignal(int)
+    selection_changed = QtCore.pyqtSignal(str)   # the selected spec
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tiles: list[MonitorTile] = []
-        self._selected_idx = 0
+        self._selected_spec = screens.AUTO
 
         self._group = QtWidgets.QButtonGroup(self)
         self._group.setExclusive(True)
@@ -324,16 +329,22 @@ class MonitorPicker(QtWidgets.QWidget):
 
         self.refresh()
 
-    def selected_index(self) -> int:
-        return self._selected_idx
+    def selected_spec(self) -> str:
+        """"auto" or a device name — never a bare index (they are not stable)."""
+        return self._selected_spec
 
-    def set_selected_index(self, idx: int) -> bool:
-        """Check the tile matching `idx` if present. Returns True on match."""
+    def set_selected_spec(self, spec: str) -> bool:
+        """Check the tile for `spec` if present. Returns True on match."""
         for t in self._tiles:
-            if t.idx == idx:
+            if t.spec.lower() == (spec or "").lower():
                 t.setChecked(True)
                 return True
         return False
+
+    def selected_index(self) -> int:
+        """Resolve the selection to a dxcam index now (-1 if it cannot be)."""
+        out, _why = screens.resolve(self._selected_spec)
+        return out.idx if out else -1
 
     def refresh(self):
         # Tear down existing tiles before re-enumerating.
@@ -348,28 +359,31 @@ class MonitorPicker(QtWidgets.QWidget):
             if w is not None:
                 w.deleteLater()
 
-        monitors = preflight.list_monitors()
-        if not monitors:
-            note = QtWidgets.QLabel("(could not enumerate monitors; assuming primary)")
+        outputs = screens.enumerate_outputs()
+        if not outputs:
+            note = QtWidgets.QLabel("(could not enumerate monitors; will use the primary)")
             note.setStyleSheet("color: gray;")
             self._row.addWidget(note)
-            self._selected_idx = 0
-            self._readout.setText("Selected: 0  (assumed)")
+            self._selected_spec = screens.AUTO
+            self._readout.setText("Selected: auto (assumed)")
             return
 
-        for idx, label in monitors:
-            tile = MonitorTile(idx, label, parent=self)
+        auto = MonitorTile(-1, "Follow the League game window; otherwise the primary display",
+                           spec=screens.AUTO, text="Auto\n(game window)", parent=self)
+        auto.setIcon(QtGui.QIcon(auto._make_placeholder_text("auto")))
+        self._row.addWidget(auto)
+        self._group.addButton(auto, 0)
+        self._tiles.append(auto)
+        for n, o in enumerate(outputs, 1):
+            text = f"{o.short}  {o.width}x{o.height}" + ("\nprimary" if o.primary else f"\n@({o.left},{o.top})")
+            tile = MonitorTile(o.idx, o.describe(), spec=o.device, text=text, parent=self)
             self._row.addWidget(tile)
-            self._group.addButton(tile, idx)
+            self._group.addButton(tile, n)
             self._tiles.append(tile)
 
-        # Preserve previous selection if the same index still exists; else pick 0.
-        existing = {t.idx for t in self._tiles}
-        target = self._selected_idx if self._selected_idx in existing else self._tiles[0].idx
-        for t in self._tiles:
-            if t.idx == target:
-                t.setChecked(True)
-                break
+        # Preserve the previous selection if that display still exists; else auto.
+        if not self.set_selected_spec(self._selected_spec):
+            self._tiles[0].setChecked(True)
         self._update_readout()
 
         # Grab thumbnails one at a time, processing events between each so the
@@ -377,6 +391,8 @@ class MonitorPicker(QtWidgets.QWidget):
         self._refresh_btn.setEnabled(False)
         try:
             for tile in list(self._tiles):
+                if tile.idx < 0:
+                    continue
                 QtWidgets.QApplication.processEvents()
                 pix = _grab_monitor_thumbnail(tile.idx, MonitorTile.THUMB)
                 if pix is not None:
@@ -387,15 +403,16 @@ class MonitorPicker(QtWidgets.QWidget):
     def _on_button_toggled(self, button_id: int, checked: bool):
         if not checked:
             return
-        self._selected_idx = button_id
+        btn = self._group.button(button_id)
+        self._selected_spec = getattr(btn, "spec", screens.AUTO)
         self._update_readout()
-        self.selection_changed.emit(button_id)
+        self.selection_changed.emit(self._selected_spec)
 
     def _update_readout(self):
         for tile in self._tiles:
-            if tile.idx == self._selected_idx:
+            if tile.spec == self._selected_spec:
                 self._readout.setStyleSheet("")
-                self._readout.setText(f"Selected: {tile.idx}  {tile.label}")
+                self._readout.setText(f"Selected: {tile.label}")
                 return
 
 
@@ -1326,9 +1343,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if idx >= 0:
                 self.encoder_combo.setCurrentIndex(idx)
 
-        monitor = self._settings.value("capture/monitor", -1, type=int)
-        if monitor >= 0:
-            self.monitor_picker.set_selected_index(monitor)
+        spec = self._settings.value("capture/monitor_spec", "", type=str)
+        if not spec:
+            legacy = self._settings.value("capture/monitor", -1, type=int)
+            if legacy >= 0:
+                # A saved index is ambiguous (DXGI order is not stable), so it
+                # becomes "auto" rather than a guess at which display it meant.
+                log.info("capture/monitor=%d migrated to monitor_spec=auto", legacy)
+                ledger.note("settings:capture/monitor",
+                            f"legacy index {legacy} replaced by 'auto' (indices are not stable)")
+            spec = screens.AUTO
+        self.monitor_picker.set_selected_spec(spec)
 
         # QSettings.value with type=list is unreliable across backends; coerce
         # whatever shape comes back into a list of strings.
@@ -1373,7 +1398,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._settings.setValue("capture/encoder", data)
 
     def _save_monitor_pref(self):
-        self._settings.setValue("capture/monitor", self.monitor_picker.selected_index())
+        self._settings.setValue("capture/monitor_spec", self.monitor_picker.selected_spec())
 
     def _save_audio_pref(self):
         # Devices the user has currently ticked.
@@ -1816,17 +1841,15 @@ class MainWindow(QtWidgets.QMainWindow):
             spin.setEnabled(on)
 
     def _open_region_picker(self):
-        monitor_idx = self.monitor_picker.selected_index()
-        screens = QtGui.QGuiApplication.screens()
-        if monitor_idx >= len(screens):
+        out, why = screens.resolve(self.monitor_picker.selected_spec())
+        qscreen = screens.qt_screen_for_output(out, QtGui.QGuiApplication.screens()) if out else None
+        if qscreen is None:
             QtWidgets.QMessageBox.warning(
                 self, "Region picker",
-                f"Qt sees {len(screens)} screen(s); cannot open picker for monitor "
-                f"index {monitor_idx}. Note: Qt and dxcam screen ordering may differ "
-                f"if the primary display has changed since this app started."
-            )
+                f"Cannot find the display to pick on: {why}")
             return
-        picker = RegionPicker(screens[monitor_idx])
+        log.info("region picker on %s (%s)", qscreen.name(), why)
+        picker = RegionPicker(qscreen)
         picker.region_selected.connect(self._on_region_picked)
         picker.cancelled.connect(self.show)
         self._region_picker = picker  # keep a reference so it isn't garbage-collected
@@ -1973,10 +1996,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 if item.checkState() == QtCore.Qt.CheckState.Checked:
                     name = item.data(QtCore.Qt.ItemDataRole.UserRole) or item.text()
                     audio_devices.append(name)
+        spec = self.monitor_picker.selected_spec()
+        out, why = screens.resolve(spec)
+        if out is None:
+            raise RuntimeError(f"monitor: {why}")
+        log.info("monitor %r -> %s", spec, why)
+        ledger.note("screen:choice", f"{spec!r} -> {why}")
         return {
             "output": self.output_edit.text().strip() or "recording.mp4",
             "fps": self.fps_spin.value(),
-            "monitor": self.monitor_picker.selected_index(),
+            "monitor": out.idx,
             "encoder": encoder,
             "region": region,
             "audio_devices": audio_devices,
@@ -1990,7 +2019,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _start_recording(self):
         log.info("user requested start")
-        args = self._collect_args()
+        try:
+            args = self._collect_args()
+        except RuntimeError as e:
+            self._show_remediation("Monitor problem", [preflight.Check(
+                False, "monitor", str(e), "Click Refresh under Monitor and pick a display.")])
+            return
 
         out_check = preflight.check_output(args["output"])
         if not out_check.ok:

@@ -163,6 +163,10 @@ The hotkey is **rebindable**: clicking the hotkey button opens `HotkeyCaptureDia
 
 Storing the target as a pynput-native `Key` or `KeyCode` (not a Qt `QKeySequence`) avoids a fragile Qt→pynput translation layer.
 
+### Monitor identity (screens.py)
+
+**Never store or compare a bare DXGI output index.** On 2026-10-03 the same machine, same two monitors, enumerated primary-first in one process and top-to-bottom in the next; "monitor 1" became the other screen and every recording that evening captured the desktop. `screens.enumerate_outputs()` gives each output its device name (`\\.\DISPLAY2`), desktop rectangle and primary flag; a *monitor spec* is `auto` (the display holding the League game window, class `RiotWindowClass`, else primary), `primary`, or a device name. Specs resolve to an index only at capture time via `screens.resolve()`, which also returns a one-line reason that goes into the log and the ledger (`screen:choice`), and the recorder's `read screen:` line names the display by identity. The GUI stores `capture/monitor_spec`; a legacy `capture/monitor` int migrates to `auto` (not to a guessed display) with a ledger note. The region picker maps the chosen output to a QScreen by geometry, not by position in `screens()`. `record.py --monitor` takes a spec; a bare index still works but is called out as unstable.
+
 ### Region picker and DPI
 
 `RegionPicker` is a transparent fullscreen overlay positioned via `screen.geometry()` from `QtGui.QGuiApplication.screens()`. **Coordinates from `event.position()` are Qt logical pixels; `dxcam` expects physical pixels** for its `region` argument. Multiply by `screen.devicePixelRatio()` before emitting. If you forget, captured regions on high-DPI monitors will be off by the scale factor.

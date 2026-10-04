@@ -6,6 +6,7 @@ import sys
 
 import highlights
 import logging_setup
+import screens
 from preflight import (
     ENCODER_CHOICES,
     ENCODER_PRIORITY,
@@ -28,7 +29,9 @@ def parse_args():
     p.add_argument("--fps", type=int, default=60, help="Target frames per second")
     p.add_argument("--duration", type=float, default=None,
                    help="Stop after N seconds (default: run until Ctrl+C)")
-    p.add_argument("--monitor", type=int, default=0, help="Monitor index (0 = primary)")
+    p.add_argument("--monitor", default="auto",
+                   help="auto (the League game window's monitor, else primary), primary, "
+                        "a device name like DISPLAY2, or a bare DXGI index (unstable)")
     p.add_argument("--region", nargs=4, type=int,
                    metavar=("LEFT", "TOP", "RIGHT", "BOTTOM"),
                    help="Capture only a rectangular region in screen coords")
@@ -121,6 +124,12 @@ def main():
         for d in devices:
             print(f"  {d}")
         return
+
+    out, why = screens.resolve(args.monitor)
+    if out is None:
+        sys.exit(f"monitor: {why}")
+    print(f"Monitor: {why}")
+    args.monitor = out.idx
 
     print("Preflight:")
     base = [check_ffmpeg(), check_monitor(args.monitor), check_output(args.output)]
