@@ -1108,6 +1108,11 @@ class MainWindow(QtWidgets.QMainWindow):
         test_row.addWidget(self.audio_test_label, 1)
         audio_box.addLayout(test_row)
         form.addRow("Audio:", audio_box)
+        self.audio_hint = QtWidgets.QLabel("")
+        self.audio_hint.setWordWrap(True)
+        self.audio_hint.setStyleSheet("color: #e67e22;")
+        self.audio_hint.setVisible(False)
+        form.addRow("", self.audio_hint)
 
         self.region_check = QtWidgets.QCheckBox("Limit to region")
         self.region_check.toggled.connect(self._toggle_region_inputs)
@@ -1378,6 +1383,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         item.setCheckState(QtCore.Qt.CheckState.Checked)
             finally:
                 self.audio_list.blockSignals(False)
+            self._update_audio_hint()
 
         if self._settings.value("region/enabled", False, type=bool):
             for name in ("left", "top", "right", "bottom"):
@@ -1400,7 +1406,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_monitor_pref(self):
         self._settings.setValue("capture/monitor_spec", self.monitor_picker.selected_spec())
 
+    def _update_audio_hint(self):
+        """Two inputs are mixed into one track: a source on both is recorded twice."""
+        checked = [self.audio_list.item(i).text() for i in range(self.audio_list.count())
+                   if self.audio_list.item(i).checkState() == QtCore.Qt.CheckState.Checked]
+        if len(checked) >= 2:
+            self.audio_hint.setText(
+                f"{len(checked)} inputs are mixed into one track. Anything routed to more than "
+                "one of them (e.g. a mic sent to both VoiceMeeter buses) is recorded twice and "
+                "sounds doubled. Route each source to one input, or tick one device.")
+            self.audio_hint.setVisible(True)
+        else:
+            self.audio_hint.setVisible(False)
+
     def _save_audio_pref(self):
+        self._update_audio_hint()
         # Devices the user has currently ticked.
         visible_checked = []
         visible_names = set()
@@ -2000,12 +2020,18 @@ class MainWindow(QtWidgets.QMainWindow):
         out, why = screens.resolve(spec)
         if out is None:
             raise RuntimeError(f"monitor: {why}")
-        log.info("monitor %r -> %s", spec, why)
+        # Auto with the game running: capture the game window itself (WGC),
+        # so nothing else on that display can end up in the recording.
+        window = screens.find_game_window() if spec == screens.AUTO else None
+        if window:
+            why = f"auto: League game window {window[1]!r} hwnd={window[0]} (window capture)"
+        log.info("capture %r -> %s", spec, why)
         ledger.note("screen:choice", f"{spec!r} -> {why}")
         return {
             "output": self.output_edit.text().strip() or "recording.mp4",
             "fps": self.fps_spin.value(),
             "monitor": out.idx,
+            "window": window,
             "encoder": encoder,
             "region": region,
             "audio_devices": audio_devices,
@@ -2073,6 +2099,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status_label.setText("Idle")
                 return
 
+        window = args.get("window")
         self.recorder = Recorder(
             output=args["output"],
             fps=args["fps"],
@@ -2080,6 +2107,8 @@ class MainWindow(QtWidgets.QMainWindow):
             region=args["region"],
             encoder=encoder,
             audio_devices=args["audio_devices"],
+            window_hwnd=window[0] if window else None,
+            window_title=window[1] if window else "",
         )
         # Marker collection runs beside the recorder; started once capture is
         # live (so the clock is valid), stopped in _on_capture_finished.

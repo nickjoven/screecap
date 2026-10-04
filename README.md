@@ -17,6 +17,8 @@ ts | seq | kind | target | detail | src
 
 Before the first line, the program states what it touches: the screen and audio devices while recording, the output folder you chose, its own data folder, the League client on 127.0.0.1, and nothing on the internet. Any network target outside localhost is flagged in the ledger as a violation.
 
+**Provenance.** Every push to `main` runs the test suites on a clean GitHub Windows runner and publishes a source archive with its SHA-256 (`.github/workflows/provenance.yml`, artifact `screecap-source`; tagged `v*` releases attach the same files). The archive is `git archive` of that exact commit, so anyone can rebuild it and compare the hash. Open source says you *could* read it; provenance says what you downloaded is what that source builds.
+
 Three readers of the same ledger:
 
 - **Terminal**: `screecap watch` streams it live. This is the primary view; the terminal is the screensaver.
@@ -93,6 +95,7 @@ python record.py --audio "Microphone" --audio "Stereo Mix"  # mix two sources
 - **DXGI Desktop Duplication** capture — low CPU, 60+ fps at 1080p.
 - **Hardware encoders**: NVENC, Quick Sync, libx264, mpeg4 fallback. `--encoder auto` (the default) probes them in priority order and picks the first that actually works.
 - **Audio**: capture from any dshow device; tick multiple devices in the GUI (or repeat `--audio` on the CLI) to mix mic + system audio into one track via ffmpeg's `amix` filter.
+- **Game window capture**: with *Auto* selected and League running, screecap records the game window itself through Windows Graphics Capture: other windows, the desktop and the cursor are never in frame. Without the game it falls back to the chosen display.
 - **Monitor by identity, not index**: pick *Auto* (follows the League game window, else the primary display) or a display by its device name. DXGI output order can change between runs, so a bare index is never stored.
 - **Region selection**: numeric inputs, or click-and-drag a transparent overlay on the chosen monitor.
 - **Global hotkey**: rebindable, default F9, works while another window has focus.

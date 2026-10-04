@@ -34,6 +34,16 @@ win._load_persistent_prefs()
 check(mp.selected_spec() == screens.AUTO and ledger.tail(1)[0]["target"] == "settings:capture/monitor", "legacy capture/monitor=1 migrates to auto with a ledger note")
 args = win._collect_args()
 check(isinstance(args["monitor"], int) and args["monitor"] >= 0 and ledger.tail(1)[0]["target"] == "screen:choice", "collect_args resolves the spec and announces the choice")
+# audio hint: visible only when two or more inputs are ticked
+al = win.audio_list
+if al.count() >= 2:
+    for i in range(al.count()): al.item(i).setCheckState(QtCore.Qt.CheckState.Unchecked)
+    al.item(0).setCheckState(QtCore.Qt.CheckState.Checked)
+    check(not win.audio_hint.isVisibleTo(win), "one audio input: no hint")
+    al.item(1).setCheckState(QtCore.Qt.CheckState.Checked)
+    check(win.audio_hint.isVisibleTo(win) and "recorded twice" in win.audio_hint.text(), "two audio inputs: doubled-source hint shown")
+else:
+    print("     (fewer than two audio devices here; hint check skipped)")
 # jump actions and jump list stay in lockstep
 check({"open-web", "open-terminal"} <= gui.JUMP_ACTIONS, "new jump actions registered")
 check({a for _, a, _ in windows_integration.DEFAULT_JUMP_TASKS} == gui.JUMP_ACTIONS - {"show"}, "jump list tasks == JUMP_ACTIONS minus show")

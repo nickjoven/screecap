@@ -128,7 +128,11 @@ def main():
     out, why = screens.resolve(args.monitor)
     if out is None:
         sys.exit(f"monitor: {why}")
-    print(f"Monitor: {why}")
+    window = screens.find_game_window() if args.monitor == screens.AUTO else None
+    if window:
+        print(f"Capture: League game window {window[1]!r} (Windows Graphics Capture)")
+    else:
+        print(f"Monitor: {why}")
     args.monitor = out.idx
 
     print("Preflight:")
@@ -163,6 +167,8 @@ def main():
         encoder=encoder,
         duration=args.duration,
         audio_devices=args.audio,
+        window_hwnd=window[0] if window else None,
+        window_title=window[1] if window else "",
     )
 
     try:

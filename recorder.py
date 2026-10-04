@@ -7,9 +7,8 @@ import threading
 import time
 from typing import List, Optional, Tuple
 
+import capture
 import ledger
-import screens
-import dxcam
 
 from preflight import encoder_args
 
@@ -39,7 +38,7 @@ _REPEAT_RE = re.compile(r"Last message repeated (\d+) times")
 
 
 class Recorder:
-    """Owns the dxcam camera and ffmpeg subprocess.
+    """Owns the frame source (a display via dxcam, or one window via WGC) and ffmpeg.
 
     Lifecycle:
         r = Recorder(...)
@@ -61,17 +60,23 @@ class Recorder:
         duration: Optional[float] = None,
         audio_devices: Optional[List[str]] = None,
         stall_timeout: float = STALL_TIMEOUT,
+        window_hwnd: Optional[int] = None,
+        window_title: str = "",
     ):
         self.output = output
         self.fps = fps
         self.monitor = monitor
+        # When set, capture this window (Windows Graphics Capture) instead of
+        # the monitor; `monitor`/`region` are then ignored.
+        self.window_hwnd = window_hwnd
+        self.window_title = window_title
         self.region = tuple(region) if region else None
         self.encoder = encoder
         self.duration = duration
         self.audio_devices = list(audio_devices) if audio_devices else []
         self.stall_timeout = stall_timeout
 
-        self._camera = None
+        self._camera = None   # the frame source (capture.DisplaySource / WindowSource)
         self._proc = None
         self._stderr_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
@@ -93,21 +98,20 @@ class Recorder:
             self.output, self.fps, self.monitor, self.region, self.encoder,
             self.duration, self.audio_devices,
         )
-        cam_entry = ledger.begin(
-            "read", f"screen:{screens.describe_index(self.monitor)}",
-            f"dxcam output {self.monitor}, DXGI Desktop Duplication, {self.fps} fps, "
-            f"region={self.region or 'full'}")
-        cam = dxcam.create(output_idx=self.monitor, output_color="BGR")
-        if cam is None:
-            cam_entry.err("no DXGI output at that monitor index")
-            raise RuntimeError(f"No DXGI output at monitor index {self.monitor}")
-        self._camera = cam
-        self._camera.start(target_fps=self.fps, video_mode=True, region=self.region)
-
-        first = self._camera.get_latest_frame()
-        self.height, self.width = first.shape[:2]
+        if self.window_hwnd:
+            source = capture.WindowSource(self.window_hwnd, self.fps, self.window_title)
+        else:
+            source = capture.DisplaySource(self.monitor, self.fps, self.region)
+        cam_entry = ledger.begin("read", source.describe(), source.detail())
+        try:
+            self.width, self.height = source.start()
+        except Exception as e:
+            cam_entry.err(str(e))
+            raise
+        self._camera = source
+        first = source.first_frame()
         cam_entry.ok(f"{self.width}x{self.height}")
-        log.info("dxcam started: %dx%d", self.width, self.height)
+        log.info("%s source started: %dx%d", source.kind, self.width, self.height)
 
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
@@ -191,12 +195,14 @@ class Recorder:
             while not self._stop.is_set():
                 frame = self._camera.get_latest_frame()
                 if frame is None:
-                    # dxcam clears its frame buffer and returns None only after
-                    # its capture thread has exited (typically via an unhandled
-                    # backend exception logged just above). Surface a clean
-                    # error and let shutdown() finalize the MP4.
-                    self.error = "dxcam capture stopped unexpectedly (see log for details)"
-                    log.warning(self.error)
+                    # dxcam returns None only after its capture thread died;
+                    # a WindowSource returns None once the window closed.
+                    # Either way: end cleanly and let shutdown() finalize.
+                    if getattr(self._camera, "kind", "") == "window":
+                        log.info("captured window closed; ending recording")
+                    else:
+                        self.error = "dxcam capture stopped unexpectedly (see log for details)"
+                        log.warning(self.error)
                     break
                 self._proc.stdin.write(frame.tobytes())
                 self.frame_count += 1
@@ -263,7 +269,7 @@ class Recorder:
             try:
                 self._camera.stop()
             except Exception:
-                log.exception("dxcam stop raised")
+                log.exception("source stop raised")
         if self._proc is not None:
             try:
                 if self._proc.stdin and not self._proc.stdin.closed:

@@ -1,0 +1,60 @@
+# Build provenance: every push to main (and every v* tag) runs the test suites
+# on a clean Windows runner and publishes a source archive plus its SHA-256,
+# built from exactly the commit named in the job. Anyone can rebuild the
+# archive with `git archive <commit>` and compare the hash.
+name: provenance
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y --no-progress
+        shell: pwsh
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Tests (offscreen; display/window captures skip when the runner has no outputs)
+        run: |
+          $failed = 0
+          foreach ($t in @("tests\test_ledger.py", "tests\test_screens.py", "tests\test_gui_api.py", "tests\test_watch_smoke.py", "tests\test_capture.py")) {
+            Write-Host "== $t"
+            python $t
+            if ($LASTEXITCODE -ne 0) { $failed = 1 }
+          }
+          exit $failed
+        shell: pwsh
+      - name: Source archive + SHA-256
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          $name = "screecap-$($sha.Substring(0,12)).zip"
+          git archive --format=zip --prefix=screecap/ -o $name $sha
+          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii SHA256SUMS
+          "commit=$sha`narchive=$name`nsha256=$hash" | Out-File -Encoding ascii PROVENANCE.txt
+          Get-Content PROVENANCE.txt
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screecap-source
+          path: |
+            screecap-*.zip
+            SHA256SUMS
+            PROVENANCE.txt
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            screecap-*.zip
+            SHA256SUMS
+            PROVENANCE.txt

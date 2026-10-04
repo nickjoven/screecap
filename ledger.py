@@ -62,7 +62,8 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # local gets an immediate `err` line naming the violation.
 MANIFEST = {
     "reads": [
-        "the screen (DXGI Desktop Duplication) — only while recording",
+        "while recording with Auto and League running: the League game window only (Windows Graphics Capture)",
+        "while recording otherwise: the chosen screen (DXGI Desktop Duplication)",
         "the audio devices you tick (DirectShow) — only while recording",
         "the League client's lockfile or process command line, for its local port and token",
         "its own data folder: %LOCALAPPDATA%\\screecap (settings, loadouts.db, ledger.log)",
