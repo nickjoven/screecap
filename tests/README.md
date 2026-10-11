@@ -7,6 +7,7 @@ plus a temporary `LOCALAPPDATA` themselves, so they never touch your real data f
 .venv\Scripts\python.exe tests\test_ledger.py        # ledger grammar, API auth/SSE, CLI formatting
 .venv\Scripts\python.exe tests\test_gui_api.py       # real MainWindow offscreen + API round trip
 .venv\Scripts\python.exe tests\test_watch_smoke.py   # `screecap watch` as a subprocess against a live API
+.venv\Scripts\python.exe tests\test_recorder_stall.py # Recorder vs a source that blocks forever; ffmpeg command shape (no camera, no ffmpeg)
 ```
 
 From WSL: `.venv/Scripts/python.exe "$(wslpath -w tests/test_ledger.py)"`.
