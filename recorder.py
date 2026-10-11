@@ -81,6 +81,12 @@ class Recorder:
         self._stderr_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        # Newest frame published by _pump_frames(), consumed by run().
+        self._frame_thread: Optional[threading.Thread] = None
+        self._frame_cv = threading.Condition()
+        self._frame = None
+        self._frame_seq = 0
+        self._frame_exc: Optional[BaseException] = None
 
         self.frame_count = 0
         self.audio_drops = 0
@@ -113,22 +119,16 @@ class Recorder:
         cam_entry.ok(f"{self.width}x{self.height}")
         log.info("%s source started: %dx%d", source.kind, self.width, self.height)
 
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{self.width}x{self.height}", "-r", str(self.fps),
-            "-thread_queue_size", "1024",
-            # Stamp each piped frame with its real arrival time. Without this
-            # the pipe is treated as constant-rate `-r fps`, so a slow/stalled
-            # capture makes video's media clock lag wall time; ffmpeg then
-            # throttles the pipe read and the live dshow audio buffer
-            # overflows -> dropped audio. Wall-clock PTS keeps video on the
-            # same real timeline as audio, so audio is never starved: the
-            # continuous audio is effectively the master, video conforms
-            # (sparse/stretched). `-r` above stays only as the nominal rate.
-            "-use_wallclock_as_timestamps", "1",
-            "-i", "-",
-        ]
+        n_audio = len(self.audio_devices)
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+        # Audio inputs come FIRST. ffmpeg opens inputs in command-line order
+        # and rebases every input so its own first packet lands at t=0, so
+        # whatever real-time gap separates the first video stamp from the
+        # first audio sample becomes a constant A/V offset in the file. With
+        # the pipe first, that gap was the dshow device start-up (~1 s, audio
+        # early). With dshow first, the graph is already running when ffmpeg
+        # probes the pipe, and the first frame (written before launch) is
+        # stamped at that same instant: the gap is milliseconds.
         # dshow audio is a live source with no EOF, so -shortest is required:
         # without it, ffmpeg waits forever after we close the video pipe.
         for dev in self.audio_devices:
@@ -137,24 +137,51 @@ class Recorder:
                 "-rtbufsize", AUDIO_RTBUFSIZE,
                 "-i", f"audio={dev}",
             ]
+        video_in = n_audio   # the pipe's index among ffmpeg's inputs
+        cmd += [
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{self.width}x{self.height}",
+            # `-framerate`, NOT `-r`. Both set the rawvideo time base, but
+            # `-r` as an *input* option also tells ffmpeg to discard the
+            # input timestamps and regenerate constant-rate ones, which
+            # silently cancelled -use_wallclock_as_timestamps below. That
+            # was the A/V drift: Python delivers ~55-57 fps, ffmpeg counted
+            # each frame as 1/60 s, the video track ran ~6% fast and audio
+            # fell a minute behind over a 20-minute game.
+            "-framerate", str(self.fps),
+            "-thread_queue_size", "1024",
+            # Stamp each piped frame with its real arrival time. The video
+            # timeline is then wall time however many frames we managed to
+            # deliver: a slow capture gives a sparse (VFR) track, never a
+            # fast-running one. It also keeps video on the same real
+            # timeline as the live dshow audio, so the muxer never holds
+            # audio back waiting for video to catch up (which is what
+            # overflowed the dshow buffer and dropped audio). Resolution is
+            # one 1/fps tick; two frames read within one tick collapse to
+            # one under -fps_mode vfr.
+            "-use_wallclock_as_timestamps", "1",
+            "-i", "-",
+        ]
         cmd += encoder_args(self.encoder)
         # Keyframe every KEYFRAME_INTERVAL_S so highlight cuts (highlights.py)
         # that stream-copy land within that distance of the marker. Encoder
         # defaults are ~4 s (250 frames) and -g is honoured by every encoder
         # in ENCODER_PRIORITY. Costs a little bitrate on static screens.
         cmd += ["-g", str(max(1, int(self.fps * KEYFRAME_INTERVAL_S)))]
-        n_audio = len(self.audio_devices)
         if n_audio == 1:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+            cmd += [
+                "-map", f"{video_in}:v", "-map", "0:a",
+                "-c:a", "aac", "-b:a", "192k", "-shortest",
+            ]
         elif n_audio > 1:
-            # Inputs 1..N are audio (input 0 is the video pipe). amix mixes them
-            # to one stereo track. duration=shortest stops mixing when any input
-            # ends; -shortest then closes the file when video ends.
-            inputs = "".join(f"[{i + 1}:a]" for i in range(n_audio))
+            # Inputs 0..N-1 are audio (the pipe is input N). amix mixes them
+            # to one stereo track. duration=shortest stops mixing when any
+            # input ends; -shortest then closes the file when video ends.
+            inputs = "".join(f"[{i}:a]" for i in range(n_audio))
             filter_str = f"{inputs}amix=inputs={n_audio}:duration=shortest[aout]"
             cmd += [
                 "-filter_complex", filter_str,
-                "-map", "0:v", "-map", "[aout]",
+                "-map", f"{video_in}:v", "-map", "[aout]",
                 "-c:a", "aac", "-b:a", "192k", "-shortest",
             ]
         # Wall-clock video PTS make the stream variable-rate by nature;
@@ -184,16 +211,58 @@ class Recorder:
         self.start_time = time.time()
         self.is_running = True
 
+        self._frame_thread = threading.Thread(
+            target=self._pump_frames, name="capture-frames", daemon=True
+        )
+        self._frame_thread.start()
         self._watchdog_thread = threading.Thread(
             target=self._watchdog, name="capture-watchdog", daemon=True
         )
         self._watchdog_thread.start()
 
-    def run(self):
-        """Capture loop. Blocks until request_stop() or duration is reached."""
+    def _pump_frames(self):
+        """Fetch frames from the source and publish the newest one.
+
+        Runs on its own thread so a source call that never returns cannot
+        wedge run() (dxcam's output-recovery loop can spin for hours after
+        a display mode switch). Latest-wins: run() takes whatever is newest
+        when it looks, so a slow pipe skips frames exactly as before. Ends
+        on None (source gone), on an exception (handed to run()), or on
+        stop.
+        """
         try:
             while not self._stop.is_set():
                 frame = self._camera.get_latest_frame()
+                with self._frame_cv:
+                    self._frame = frame
+                    self._frame_seq += 1
+                    self._frame_cv.notify()
+                if frame is None:
+                    return
+        except Exception as e:
+            with self._frame_cv:
+                self._frame_exc = e
+                self._frame_seq += 1
+                self._frame_cv.notify()
+
+    def run(self):
+        """Capture loop. Blocks until request_stop() or duration is reached.
+
+        Frames come from _pump_frames(); this loop only waits on a condition
+        variable with a short timeout, so request_stop() always gets through.
+        """
+        seen = 0
+        try:
+            while not self._stop.is_set():
+                with self._frame_cv:
+                    while self._frame_seq == seen and not self._stop.is_set():
+                        self._frame_cv.wait(0.5)
+                    if self._stop.is_set():
+                        break
+                    seen = self._frame_seq
+                    frame, exc = self._frame, self._frame_exc
+                if exc is not None:
+                    raise exc
                 if frame is None:
                     # dxcam returns None only after its capture thread died;
                     # a WindowSource returns None once the window closed.
@@ -224,13 +293,16 @@ class Recorder:
         """Abort a wedged capture loop.
 
         commit 0806b28 handles dxcam returning None (capture thread died).
-        It cannot handle get_latest_frame() *blocking* forever: run() never
-        returns from the call, so neither the None check nor _stop is ever
-        reached. Here we watch frame_count from a side thread and, on a
-        stall, stop the *camera* (never ffmpeg). dxcam then returns None on
-        the next/blocked get_latest_frame(), run()'s existing None branch
-        breaks the loop, and the caller's shutdown() finalizes the MP4
-        normally -- the "shutdown must not kill ffmpeg" invariant holds.
+        It cannot handle get_latest_frame() *blocking* forever. Here we
+        watch frame_count from a side thread and, on a stall, stop the
+        *camera* (never ffmpeg) and then end the loop ourselves with
+        request_stop(): run() waits on a condition variable, not on the
+        source, so this gets through even when the source call never
+        returns (2026-10-10: dxcam sat in its output-recovery loop for 12 h,
+        run() never exited, shutdown() never ran, ffmpeg was orphaned and
+        the MP4 got no moov atom). The caller's shutdown() then finalizes
+        the MP4 normally -- the "shutdown must not kill ffmpeg" invariant
+        holds.
 
         Note: this catches a hard hang, not the asleep-screen case where
         video_mode keeps emitting duplicated frames (frame_count still
@@ -254,7 +326,8 @@ class Recorder:
                     if self._camera is not None:
                         self._camera.stop()
                 except Exception:
-                    log.exception("watchdog: dxcam stop raised")
+                    log.exception("watchdog: source stop raised")
+                self.request_stop()
                 return
 
     def request_stop(self):
@@ -291,6 +364,9 @@ class Recorder:
             # request_stop() above already set _stop; the watchdog wakes
             # from its <=1 s wait and exits on its own.
             self._watchdog_thread.join(timeout=2.0)
+        if self._frame_thread is not None:
+            # May be blocked inside the source forever; it is a daemon.
+            self._frame_thread.join(timeout=2.0)
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2.0)
         log.info("shutdown done")
