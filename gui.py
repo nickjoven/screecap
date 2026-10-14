@@ -15,6 +15,7 @@ import league
 import ledger
 import loadouts
 import logging_setup
+import capture
 import preflight
 import screens
 import server
@@ -263,7 +264,7 @@ def _grab_monitor_thumbnail(idx: int, size: QtCore.QSize) -> "QtGui.QPixmap | No
     ordering differs from dxcam's. Matches the recorder's output_color="BGR"
     so the cached dxcam instance is consistent when recorder.start() runs later.
     """
-    try:
+    def grab_once():
         import dxcam
         cam = dxcam.create(output_idx=idx, output_color="BGR")
         if cam is None:
@@ -273,6 +274,18 @@ def _grab_monitor_thumbnail(idx: int, size: QtCore.QSize) -> "QtGui.QPixmap | No
             # First grab() can return None if the desktop hasn't changed since
             # the duplication API was initialized. One retry is usually enough.
             frame = cam.grab()
+        return frame
+
+    try:
+        try:
+            frame = grab_once()
+        except Exception as e:
+            if not capture.is_device_removed(e):
+                raise
+            # Same dead-device state the recorder handles in DisplaySource.start.
+            log.warning("thumbnail: DXGI device removed; rebuilding dxcam and retrying once")
+            capture.reset_dxcam()
+            frame = grab_once()
         if frame is None:
             return None
         h, w = frame.shape[:2]
@@ -2213,6 +2226,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_recording()
 
     def _start_recording(self):
+        # Encoder resolution and audio probing below pump the Qt event loop
+        # (processEvents), so a second F9 can arrive while self.thread is
+        # still None. 2026-10-13: a double press started twice; the second
+        # start then sat behind the first one's error dialog for 37 minutes.
+        if self.thread is not None or getattr(self, "_starting", False):
+            log.info("start ignored: a start is already in progress")
+            return
+        self._starting = True
+        try:
+            self._start_recording_inner()
+        finally:
+            self._starting = False
+
+    def _start_recording_inner(self):
         log.info("user requested start")
         try:
             args = self._collect_args()

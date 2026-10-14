@@ -8,6 +8,7 @@ plus a temporary `LOCALAPPDATA` themselves, so they never touch your real data f
 .venv\Scripts\python.exe tests\test_gui_api.py       # real MainWindow offscreen + API round trip
 .venv\Scripts\python.exe tests\test_watch_smoke.py   # `screecap watch` as a subprocess against a live API
 .venv\Scripts\python.exe tests\test_recorder_stall.py # Recorder vs a source that blocks forever; ffmpeg command shape (no camera, no ffmpeg)
+.venv\Scripts\python.exe tests\test_capture_device_removed.py # DisplaySource vs a dead D3D device (fake dxcam, real COMError)
 ```
 
 From WSL: `.venv/Scripts/python.exe "$(wslpath -w tests/test_ledger.py)"`.

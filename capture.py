@@ -28,6 +28,54 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+# DXGI "the device you are holding is dead" codes. A GPU driver update or a
+# TDR (driver reset) invalidates every Direct3D device in every running
+# process; dxcam creates its device once at import time inside a module-level
+# singleton and never recreates it, so from then on every create()/grab()
+# fails with one of these forever. 2026-10-13: the NVIDIA driver was
+# reinstalled while the tray app was running; every F9 after that failed with
+# 0x887A0005 until the process was restarted.
+DXGI_ERROR_DEVICE_REMOVED = 0x887A0005
+DXGI_ERROR_DEVICE_RESET = 0x887A0007
+
+
+def hresult_of(exc: BaseException) -> int:
+    """Unsigned HRESULT carried by a COMError (or 0 if there is none)."""
+    h = getattr(exc, "hresult", None)
+    if h is None and getattr(exc, "args", None):
+        h = exc.args[0]
+    try:
+        return int(h) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_device_removed(exc: BaseException) -> bool:
+    return hresult_of(exc) in (DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET)
+
+
+def reset_dxcam() -> None:
+    """Throw away dxcam's cached D3D11 device(s) and cameras; build fresh ones.
+
+    dxcam keeps one DXFactory per process (a Singleton metaclass instance
+    stored as the module global `__factory`); the factory owns the Device
+    objects whose D3D11CreateDevice ran at import. Nothing in dxcam rebuilds
+    them, so after a driver reset the only cure was restarting the process.
+    screens.enumerate_outputs() re-imports `__factory` on every call, so it
+    sees the new one.
+    """
+    import dxcam
+    old = getattr(dxcam, "__factory", None)
+    if old is not None:
+        try:
+            old.clean_up()
+        except Exception:
+            log.exception("releasing dxcam cameras on the dead device raised (ignored)")
+    dxcam.Singleton._instances.pop(dxcam.DXFactory, None)
+    dxcam.DXFactory._camera_instances.clear()
+    setattr(dxcam, "__factory", dxcam.DXFactory())
+    log.warning("dxcam factory rebuilt: new D3D11 device after a DXGI device-removed error")
+
 
 class DisplaySource:
     kind = "display"
@@ -47,6 +95,22 @@ class DisplaySource:
                 f"region={self.region or 'full'}")
 
     def start(self) -> Tuple[int, int]:
+        try:
+            return self._open()
+        except Exception as e:
+            if not is_device_removed(e):
+                raise
+            log.warning(
+                "DXGI device removed (0x%08X) opening output %d: the GPU driver was "
+                "reset or updated since dxcam initialised; rebuilding dxcam and "
+                "retrying once", hresult_of(e), self.monitor,
+            )
+            self.stop()
+            self._camera = None
+            reset_dxcam()
+            return self._open()
+
+    def _open(self) -> Tuple[int, int]:
         import dxcam
         cam = dxcam.create(output_idx=self.monitor, output_color="BGR")
         if cam is None:
