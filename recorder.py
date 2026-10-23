@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 
 import capture
 import ledger
+import sidecars
 
 from preflight import encoder_args
 
@@ -286,8 +287,9 @@ class Recorder:
             log.exception("capture loop error after %d frames", self.frame_count)
         finally:
             self.is_running = False
+            self.loop_elapsed = self.elapsed   # `elapsed` keeps ticking; this is the capture span
             log.info("capture loop exited: frames=%d elapsed=%.2fs",
-                     self.frame_count, self.elapsed)
+                     self.frame_count, self.loop_elapsed)
 
     def _watchdog(self):
         """Abort a wedged capture loop.
@@ -369,7 +371,23 @@ class Recorder:
             self._frame_thread.join(timeout=2.0)
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2.0)
+        self._write_done_sidecar()
         log.info("shutdown done")
+
+    def _write_done_sidecar(self):
+        """Tell downstream tools the MP4 is final. Never raises."""
+        if self._proc is None or not os.path.exists(self.output):
+            return
+        try:
+            sidecars.write_done(
+                self.output,
+                ffmpeg_rc=self._proc.returncode,
+                frames=self.frame_count,
+                elapsed_s=round(getattr(self, "loop_elapsed", None) or self.elapsed, 3),
+                error=self.error,
+            )
+        except Exception:
+            log.exception("writing done sidecar failed")
 
     def _answer_ledger(self, rc):
         """Close the exec/write ledger entries opened in start()."""

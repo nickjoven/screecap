@@ -58,6 +58,8 @@ web/index.html          browser view: status, manifest, live ledger, source draw
 cli.py                  `screecap` launcher/reader: open, watch, status, ledger, gui, record
 league/                 LCU (REST + WebSocket) and Live Client Data       (UI-agnostic)
 highlights.py           Tagger (markers beside the Recorder) + cut       (UI-agnostic)
+sidecars.py             <stem>.done.json (Recorder.shutdown) + <stem>.match.json (EndOfGame) for strata  (UI-agnostic)
+tools/avsync.py         A/V offset + drift measurement on a finished MP4 (WSL, numpy; read-only)
 loadouts.py             Per-champion spell/rune memory, spell lock, apply   (UI-agnostic)
 record.py               CLI front-end (argparse, signal.SIGINT)
 gui.py                  PyQt6 front-end (worker thread, hotkey, tray icon)

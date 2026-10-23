@@ -19,6 +19,7 @@ import capture
 import preflight
 import screens
 import server
+import sidecars
 import windows_integration
 from recorder import Recorder
 
@@ -1023,6 +1024,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ignore phase transitions so the user keeps full control.
         self._auto_started = False
         self._lcu_phase = ""
+        self._match_video = None   # recording of the game whose stats are pending
         self._lcu_connected = False
         # Local API + browser view (server.py). Started after the UI exists so
         # status/actions have something to talk to; stopped on real quit.
@@ -1660,6 +1662,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_lcu_phase_changed(self, phase: str):
         if phase != self._lcu_phase:
             ledger.note("league:phase", phase)
+        if self._lcu_phase == "InProgress" and phase != "InProgress" and self.recorder is not None:
+            # The game this recording covers just ended; its stats arrive at EndOfGame.
+            self._match_video = self.recorder.output
+        if phase == "EndOfGame" and self._match_video:
+            self._fetch_match_sidecar(self._match_video)
+            self._match_video = None
         self._lcu_phase = phase
         self.auto_record_status.setText(f"phase: {phase}")
         log.info("LCU phase: %s (recording=%s, auto_started=%s)",
@@ -1673,6 +1681,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._stop_recording()
         if loadouts.is_postgame_phase(phase):
             self._maybe_show_postgame()
+
+    def _fetch_match_sidecar(self, video: str):
+        """Write <video>.match.json from the LCU end-of-game stats, off the GUI thread."""
+        def work():
+            try:
+                lockfile = league.discover_lockfile()
+                if lockfile is None:
+                    log.warning("match sidecar: no League lockfile")
+                    return
+                sidecars.write_match(video, league.Client(lockfile).end_of_game_stats())
+            except Exception:
+                log.exception("match sidecar failed for %s", video)
+        threading.Thread(target=work, name="match-sidecar", daemon=True).start()
 
     def _maybe_show_postgame(self):
         """Show the keep/change reminder once per game, if enabled."""
