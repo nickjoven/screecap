@@ -8,6 +8,7 @@ import time
 from typing import List, Optional, Tuple
 
 import capture
+import gpuclaim
 import ledger
 import sidecars
 
@@ -79,6 +80,7 @@ class Recorder:
 
         self._camera = None   # the frame source (capture.DisplaySource / WindowSource)
         self._proc = None
+        self._gpu_claim = gpuclaim.RecordingClaim()
         self._stderr_thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -220,6 +222,10 @@ class Recorder:
             target=self._watchdog, name="capture-watchdog", daemon=True
         )
         self._watchdog_thread.start()
+        # Capture is live: batch GPU jobs on the box yield to the user now.
+        # Taken here, on the capture thread, and released in shutdown() on
+        # the same thread (a mutex belongs to the thread that took it).
+        self._gpu_claim.claim()
 
     def _pump_frames(self):
         """Fetch frames from the source and publish the newest one.
@@ -372,6 +378,9 @@ class Recorder:
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=2.0)
         self._write_done_sidecar()
+        claim = getattr(self, "_gpu_claim", None)
+        if claim is not None:
+            claim.release()
         log.info("shutdown done")
 
     def _write_done_sidecar(self):

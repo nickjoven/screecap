@@ -59,6 +59,7 @@ cli.py                  `screecap` launcher/reader: open, watch, status, ledger,
 league/                 LCU (REST + WebSocket) and Live Client Data       (UI-agnostic)
 highlights.py           Tagger (markers beside the Recorder) + cut       (UI-agnostic)
 sidecars.py             <stem>.done.json (Recorder.shutdown) + <stem>.match.json (EndOfGame) for strata  (UI-agnostic)
+gpuclaim.py             holds Global\homeserv-gpu-recording while recording: batch GPU jobs yield (UI-agnostic)
 tools/avsync.py         A/V offset + drift measurement on a finished MP4 (WSL, numpy; read-only)
 loadouts.py             Per-champion spell/rune memory, spell lock, apply   (UI-agnostic)
 record.py               CLI front-end (argparse, signal.SIGINT)
